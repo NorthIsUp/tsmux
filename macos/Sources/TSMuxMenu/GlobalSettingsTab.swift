@@ -97,7 +97,15 @@ struct GlobalSettingsTab: View {
   // MARK: window
 
   @ViewBuilder private var window: some View {
-    Section("Window") {
+    Section("Menu Bar") {
+      VStack(alignment: .leading, spacing: 3) {
+        Toggle(
+          "Always show the tailnet count",
+          isOn: Binding(get: { model.alwaysShowCount }, set: { model.alwaysShowCount = $0 }))
+        Text("Off: the count appears only when a tailnet is not connected.")
+          .font(.footnote)
+          .foregroundStyle(.secondary)
+      }
       VStack(alignment: .leading, spacing: 3) {
         Toggle(
           "Hide Dock Icon",

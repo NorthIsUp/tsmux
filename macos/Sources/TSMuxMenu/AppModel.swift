@@ -68,6 +68,7 @@ final class AppModel {
 
   static let pacKey = "pacApplied"
   static let pacAutoKey = "pacAuto"
+  static let alwaysCountKey = "alwaysShowCount"
   static let hideDockKey = "hideDockIcon"
   static let connectAtLaunchKey = "connectAtLaunch"
   static let didShowFirstRunKey = "didShowFirstRun"
@@ -316,6 +317,15 @@ final class AppModel {
   var pacAuto: Bool {
     get { (UserDefaults.standard.object(forKey: Self.pacAutoKey) as? Bool) ?? true }
     set { UserDefaults.standard.set(newValue, forKey: Self.pacAutoKey) }
+  }
+
+  /// Off by default: the count only appears when a tailnet is not up.
+  var alwaysShowCount: Bool {
+    get { UserDefaults.standard.bool(forKey: Self.alwaysCountKey) }
+    set {
+      UserDefaults.standard.set(newValue, forKey: Self.alwaysCountKey)
+      notify()
+    }
   }
 
   func togglePAC() {

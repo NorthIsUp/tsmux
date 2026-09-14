@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -313,48 +314,88 @@ func (m *Manager) Dial(ctx context.Context, network, hostport string) (net.Conn,
 	return n.Dial(ctx, network, hostport)
 }
 
-// Dial reaches hostport inside this node's tailnet, trying every address the
-// tailnet resolves, IPv4 first. tsnet otherwise commits to one address, and a
-// peer that advertises an unreachable IPv6 address fails outright even though
-// its IPv4 address works.
+// Dial reaches hostport inside this node's tailnet.
+//
+// tsnet's own Dial is tried first because only it resolves the tailnet's DNS
+// the way the tailnet means it — split-DNS domains like a company's own
+// hostnames are invisible to any resolver outside the node. If that dial
+// fails we retry against the tailnet's A records explicitly, because tsnet
+// commits to a single address and a peer advertising an unreachable IPv6
+// address would otherwise fail outright while its IPv4 address works.
 func (n *Node) Dial(ctx context.Context, network, hostport string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(hostport)
-	if err != nil {
-		return n.srv.Dial(ctx, network, hostport)
+	conn, err := n.srv.Dial(ctx, network, hostport)
+	if err == nil {
+		return conn, nil
 	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return n.srv.Dial(ctx, network, hostport)
+	host, port, splitErr := net.SplitHostPort(hostport)
+	if splitErr != nil {
+		return nil, err
 	}
-	ips, err := n.Resolve(ctx, host)
-	if err != nil || len(ips) == 0 {
-		return n.srv.Dial(ctx, network, hostport)
+	if _, isIP := netip.ParseAddr(host); isIP == nil {
+		return nil, err
 	}
-	sort.SliceStable(ips, func(i, j int) bool {
-		return ips[i].IP.To4() != nil && ips[j].IP.To4() == nil
-	})
-	var errs []string
-	for _, ip := range ips {
-		c, err := n.srv.Dial(ctx, network, net.JoinHostPort(ip.IP.String(), port))
-		if err == nil {
+	v4, qErr := n.queryTailnetDNS(ctx, host, "A")
+	if qErr != nil || len(v4) == 0 {
+		return nil, err
+	}
+	for _, ip := range v4 {
+		c, dErr := n.srv.Dial(ctx, network, net.JoinHostPort(ip.String(), port))
+		if dErr == nil {
 			return c, nil
 		}
-		errs = append(errs, fmt.Sprintf("%s: %v", ip.IP, err))
 		if ctx.Err() != nil {
 			break
 		}
 	}
-	return nil, fmt.Errorf("%s: %s", host, strings.Join(errs, "; "))
+	return nil, err
 }
 
-// Resolve looks up a name using only this profile's tailnet DNS.
-func (n *Node) Resolve(ctx context.Context, host string) ([]net.IPAddr, error) {
-	r := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return n.srv.Dial(ctx, network, addr)
-		},
+// queryTailnetDNS asks this node's own resolver, so split-DNS domains and
+// MagicDNS names resolve whether or not a system Tailscale is installed.
+func (n *Node) queryTailnetDNS(ctx context.Context, host, qtype string) ([]netip.Addr, error) {
+	lc, err := n.srv.LocalClient()
+	if err != nil {
+		return nil, err
 	}
-	return r.LookupIPAddr(ctx, host)
+	raw, _, err := lc.QueryDNS(ctx, host, qtype)
+	if err != nil {
+		return nil, err
+	}
+	var msg dnsmessage.Message
+	if err := msg.Unpack(raw); err != nil {
+		return nil, err
+	}
+	var out []netip.Addr
+	for _, a := range msg.Answers {
+		switch r := a.Body.(type) {
+		case *dnsmessage.AResource:
+			out = append(out, netip.AddrFrom4(r.A))
+		case *dnsmessage.AAAAResource:
+			out = append(out, netip.AddrFrom16(r.AAAA))
+		}
+	}
+	return out, nil
+}
+
+// Resolve looks up a name using only this profile's tailnet DNS. It asks the
+// node's own resolver rather than the host's: a Go resolver would talk to
+// whatever nameservers this machine is configured with, which answers only
+// because a system Tailscale put 100.100.100.100 there.
+func (n *Node) Resolve(ctx context.Context, host string) ([]net.IPAddr, error) {
+	var out []net.IPAddr
+	for _, qtype := range []string{"A", "AAAA"} {
+		addrs, err := n.queryTailnetDNS(ctx, host, qtype)
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			out = append(out, net.IPAddr{IP: a.AsSlice()})
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s: no answer from this tailnet's DNS", host)
+	}
+	return out, nil
 }
 
 type Status struct {
@@ -610,6 +651,25 @@ func (m *Manager) Close() error {
 		}
 	}
 	m.nodes = map[string]*Node{}
+	return err
+}
+
+// prefsEditor is the slice of the tailscale local client that persistLogin
+// needs, so the commit can be tested without a tailnet.
+type prefsEditor interface {
+	EditPrefs(context.Context, *ipn.MaskedPrefs) (*ipn.Prefs, error)
+}
+
+// persistLogin forces the backend to write the current profile to disk as soon
+// as a node is up. A login that exists only in memory is lost on the next
+// restart, and the node then asks to sign in again with nothing to say why —
+// which is exactly what happened before this existed. A masked edit of a pref
+// the node already holds is enough to make the backend commit.
+func persistLogin(ctx context.Context, ed prefsEditor) error {
+	_, err := ed.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs:          ipn.Prefs{WantRunning: true},
+		WantRunningSet: true,
+	})
 	return err
 }
 

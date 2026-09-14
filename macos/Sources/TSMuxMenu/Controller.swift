@@ -75,7 +75,7 @@ final class Controller: NSObject, NSMenuDelegate {
     var dimmed = false
 
     if case .firstRun = model.configState {
-      button.image = Self.barImage("point.3.connected.trianglepath.dotted")
+      button.image = Self.gridImage(connected: 0, total: 0)
       button.appearsDisabled = true
       button.title = ""
       button.toolTip = "tsmux — no tailnets set up yet"
@@ -87,23 +87,20 @@ final class Controller: NSObject, NSMenuDelegate {
     case .ok:
       if ps.contains(where: { $0.condition == .needsLogin }) {
         symbol = "exclamationmark.triangle.fill"
-        badge = "\(up)/\(total)"
         label = "tsmux, \(ps.filter { $0.condition == .needsLogin }.count) tailnets need login"
       } else if ps.contains(where: { $0.condition == .failed }) {
         symbol = "exclamationmark.triangle.fill"
-        badge = "\(up)/\(total)"
         label = "tsmux, \(ps.filter { $0.condition == .failed }.count) tailnets have errors"
       } else {
-        symbol = "point.3.filled.connected.trianglepath.dotted"
-        if total > 1 { badge = "\(up)/\(total)" }
+        symbol = "grid"
         label = "tsmux, \(up) of \(total) tailnets connected"
       }
     case .starting:
-      symbol = "point.3.connected.trianglepath.dotted"
+      symbol = "grid"
       badge = "…"
       label = "tsmux, starting"
     case .down:
-      symbol = "point.3.connected.trianglepath.dotted"
+      symbol = "grid"
       dimmed = true
       label = "tsmux, not running"
     case .failed, .crashed, .cliMissing:
@@ -111,7 +108,18 @@ final class Controller: NSObject, NSMenuDelegate {
       label = "tsmux, can't read status"
     }
 
-    let image = Self.barImage(symbol)
+    // "5/5" is noise — everything is fine and the grid already says so. The
+    // count earns its space only when some tailnet is not up.
+    if case .ok = model.ui, total > 0, up < total || model.alwaysShowCount {
+      badge = "\(up)/\(total)"
+    }
+
+    // The grid carries the count itself; a warning symbol still wins when
+    // something actually needs the user.
+    let image =
+      symbol == "exclamationmark.triangle.fill"
+      ? Self.barImage(symbol)
+      : Self.gridImage(connected: up, total: total)
     button.image = image
     button.appearsDisabled = dimmed
     button.toolTip = label
@@ -140,6 +148,50 @@ final class Controller: NSObject, NSMenuDelegate {
       .withSymbolConfiguration(
         NSImage.SymbolConfiguration(pointSize: 15, weight: .medium, scale: .medium))
     image?.isTemplate = true
+    return image
+  }
+
+  /// The menu bar mark: a dot grid with an arrow rising through the middle —
+  /// Tailscale's family resemblance, plus the one thing tsmux adds, which is
+  /// traffic being routed up through several tailnets at once.
+  ///
+  /// Filled dots count the connected tailnets, so the icon carries the state
+  /// that a "2/3" text badge used to. Drawn rather than an asset: it has to
+  /// change with the count, and a template image tints itself in both menu
+  /// bar appearances for free.
+  static func gridImage(connected: Int, total: Int) -> NSImage {
+    let size = NSSize(width: 17, height: 15)
+    let image = NSImage(size: size, flipped: false) { _ in
+      guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+      let dotR: CGFloat = 1.5
+      let colX: [CGFloat] = [3, 13]
+      let rowY: [CGFloat] = [3, 7.5, 12]
+      // Fill order is bottom-up, left column first, so the first tailnet to
+      // connect lights the dot nearest the arrow's base.
+      var slots: [(CGFloat, CGFloat)] = []
+      for y in rowY { for x in colX { slots.append((x, y)) } }
+      let lit = max(0, min(connected, slots.count))
+      // With nothing configured, show the full grid faintly rather than a
+      // blank patch of menu bar.
+      let dimAll = total == 0
+      for (i, p) in slots.enumerated() {
+        let on = !dimAll && i < lit
+        ctx.setFillColor(NSColor.black.withAlphaComponent(on ? 1 : 0.3).cgColor)
+        ctx.fillEllipse(in: CGRect(x: p.0 - dotR, y: p.1 - dotR, width: dotR * 2, height: dotR * 2))
+      }
+      ctx.setFillColor(NSColor.black.withAlphaComponent(dimAll ? 0.3 : 1).cgColor)
+      let midX: CGFloat = 8.5
+      let head: CGFloat = 3.1
+      ctx.move(to: CGPoint(x: midX, y: 14))
+      ctx.addLine(to: CGPoint(x: midX - head, y: 14 - head - 0.6))
+      ctx.addLine(to: CGPoint(x: midX + head, y: 14 - head - 0.6))
+      ctx.closePath()
+      ctx.fillPath()
+      ctx.setFillColor(NSColor.black.withAlphaComponent(dimAll ? 0.3 : 1).cgColor)
+      ctx.fill(CGRect(x: midX - 0.9, y: 2, width: 1.8, height: 8.4))
+      return true
+    }
+    image.isTemplate = true
     return image
   }
 
