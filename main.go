@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/NorthIsUp/tsmux/internal/tsmux"
 )
@@ -48,7 +49,7 @@ func root() *cobra.Command {
 	c.PersistentFlags().StringVar(&cfgPath, "config", "", "config file path")
 	c.PersistentFlags().BoolVarP(&outputJSON, "json", "j", false, "emit JSON")
 	c.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable debug logging")
-	c.AddCommand(cmdInit(), cmdUp(), cmdStatus(), cmdTest(), cmdProfile(), cmdPAC(),
+	c.AddCommand(cmdInit(), cmdUp(), cmdDown(), cmdStatus(), cmdTest(), cmdProfile(), cmdPAC(),
 		cmdEnv(), cmdRun(), cmdConnect(), cmdTunnel(), cmdDNS(), cmdSSH(), cmdDoctor(), cmdVersion())
 	return c
 }
@@ -177,6 +178,7 @@ func cmdUp() *cobra.Command {
 				return fmt.Errorf("pac server: %w", err)
 			}
 			closers = append(closers, func() { pl.Close() })
+			m.OnStop(stop)
 			go (&http.Server{Handler: cfg.LocalHandler(m)}).Serve(pl)
 			log.Printf("%-12s %s", "pac", cfg.PACURL())
 			log.Printf("%-12s %s", "status", cfg.StatusURL())
@@ -221,6 +223,31 @@ func cmdUp() *cobra.Command {
 	}
 	c.Flags().BoolVar(&applyProxy, "system-proxy", false, "point the system proxy at the PAC file, and restore it on exit")
 	return c
+}
+
+func cmdDown() *cobra.Command {
+	return &cobra.Command{
+		Use: "down", Short: "Stop the running tsmux daemon",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			cfg, err := load()
+			if err != nil {
+				return err
+			}
+			if err := cfg.Shutdown(); err != nil {
+				return err
+			}
+			// Wait for the listener to actually go away: callers stop the
+			// daemon in order to do something that needs it gone.
+			for i := 0; i < 60; i++ {
+				if _, err := cfg.FetchStatus(); err != nil {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			fmt.Println("stopped")
+			return nil
+		},
+	}
 }
 
 // --- status / test ----------------------------------------------------------
@@ -447,7 +474,8 @@ func cmdProfile() *cobra.Command {
 func cmdProfileSet() *cobra.Command {
 	var req tsmux.PrefsRequest
 	var acceptRoutes, acceptDNS, shieldsUp, exitNodeLAN bool
-	var exitNode string
+	var exitNode, hostname string
+	var addSuffix, rmSuffix []string
 	c := &cobra.Command{
 		Use: "set <name>", Short: "Change one profile's Tailscale preferences", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -458,6 +486,50 @@ func cmdProfileSet() *cobra.Command {
 			if _, ok := cfg.Profiles[args[0]]; !ok {
 				return fmt.Errorf("no profile %q", args[0])
 			}
+			// Config-level changes (device name, claimed domains) are not live
+			// prefs: the daemon fixes both when a node starts, so they apply on
+			// its next start rather than being pushed to a running node.
+			p := cfg.Profiles[args[0]]
+			configChanged := false
+			if cmd.Flags().Changed("hostname") {
+				if err := tsmux.ValidateHostname(hostname); err != nil {
+					return err
+				}
+				p.Hostname = hostname
+				configChanged = true
+			}
+			for _, sfx := range addSuffix {
+				owner, err := cfg.ClaimSuffix(args[0], sfx)
+				if err != nil {
+					return err
+				}
+				if owner != "" {
+					return fmt.Errorf("%s is already claimed by profile %q", sfx, owner)
+				}
+				configChanged = true
+			}
+			for _, sfx := range rmSuffix {
+				if !cfg.ReleaseSuffix(args[0], sfx) {
+					return fmt.Errorf("profile %q does not claim %s", args[0], sfx)
+				}
+				configChanged = true
+			}
+			if configChanged {
+				if err := cfg.Save(cfg.Path()); err != nil {
+					return err
+				}
+				if onlyConfigChanged(cmd) {
+					emit(map[string]any{"profile": args[0], "hostname": p.Hostname,
+						"suffixes": p.Suffixes,
+						"note":     "applies when this profile's node next starts"},
+						func() {
+							fmt.Printf("%s: %s · %s (applies on next start)\n",
+								args[0], p.Hostname, strings.Join(p.Suffixes, " "))
+						})
+					return nil
+				}
+			}
+
 			req.Profile = args[0]
 			// Only flags the user actually passed are sent; the rest stay put.
 			for name, set := range map[string]func(){
@@ -484,7 +556,24 @@ func cmdProfileSet() *cobra.Command {
 	c.Flags().BoolVar(&shieldsUp, "shields-up", false, "block incoming connections")
 	c.Flags().StringVar(&exitNode, "exit-node", "", "stable node ID of an exit node, or \"\" to clear")
 	c.Flags().BoolVar(&exitNodeLAN, "exit-node-lan", false, "allow local network access while using an exit node")
+	c.Flags().StringVar(&hostname, "hostname", "", "device name this profile registers in the tailnet (applies on next start)")
+	c.Flags().StringSliceVar(&addSuffix, "add-suffix", nil, "also route this DNS suffix to this tailnet, e.g. .example.com")
+	c.Flags().StringSliceVar(&rmSuffix, "remove-suffix", nil, "stop routing this DNS suffix to this tailnet")
 	return c
+}
+
+// onlyConfigChanged reports whether every flag passed was config-level, in
+// which case there is no live pref to push and no daemon needs to be running.
+func onlyConfigChanged(cmd *cobra.Command) bool {
+	only := true
+	cmd.Flags().Visit(func(f *pflag.Flag) {
+		switch f.Name {
+		case "hostname", "add-suffix", "remove-suffix", "config", "json", "verbose":
+		default:
+			only = false
+		}
+	})
+	return only
 }
 
 // --- pac --------------------------------------------------------------------
@@ -597,6 +686,9 @@ func cmdRun() *cobra.Command {
 	c := &cobra.Command{
 		Use: "run <command> [args...]", Short: "Run a command with tsmux proxy env applied",
 		Args: cobra.MinimumNArgs(1), DisableFlagsInUseLine: true,
+		// Everything after the command name belongs to the wrapped command;
+		// without this, `tsmux run curl -sS ...` dies on curl's own flags.
+		TraverseChildren: false,
 		RunE: func(_ *cobra.Command, args []string) error {
 			cfg, err := load()
 			if err != nil {
@@ -625,6 +717,7 @@ func cmdRun() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&profile, "profile", "", "pin the command to one profile's proxy")
+	c.Flags().SetInterspersed(false)
 	return c
 }
 

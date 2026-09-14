@@ -13,6 +13,41 @@ struct ExitNodeOption: Decodable, Sendable, Identifiable, Hashable {
   let current: Bool
 }
 
+/// One peer in a tailnet. `owner` is empty for tagged nodes — those group
+/// under their tag instead, the way the admin console presents them.
+struct Device: Decodable, Sendable, Identifiable, Hashable {
+  let name: String
+  let hostname: String
+  let ips: [String]?
+  let os: String?
+  let owner: String?
+  let tags: [String]?
+  let online: Bool
+  let exitNode: Bool?
+
+  var id: String { name }
+
+  enum CodingKeys: String, CodingKey {
+    case name, hostname, ips, os, owner, tags, online
+    case exitNode = "exit_node"
+  }
+
+  /// What a plain click copies: something you can paste into a browser.
+  var url: String { "https://\(name)" }
+  var primaryIP: String? { ips?.first }
+  /// The short name, which is what you type at a shell.
+  var shortName: String {
+    hostname.isEmpty ? String(name.split(separator: ".").first ?? "") : hostname
+  }
+
+  /// Group heading this device belongs under.
+  var group: String {
+    if let t = tags?.first, !t.isEmpty { return t }
+    if let o = owner, !o.isEmpty { return o }
+    return "Other"
+  }
+}
+
 struct ProfilePrefs: Decodable, Sendable, Hashable {
   let acceptRoutes: Bool
   let acceptDNS: Bool
@@ -46,6 +81,7 @@ struct ProfileStatus: Decodable, Sendable, Identifiable {
   let displayName: String
   let state: String
   let selfName: String?
+  let deviceName: String?
   let ips: [String]?
   let peers: Int?
   let authURL: String?
@@ -63,12 +99,14 @@ struct ProfileStatus: Decodable, Sendable, Identifiable {
   let adminURL: String?
   let prefs: ProfilePrefs?
   let exitNodeOptions: [ExitNodeOption]?
+  let devices: [Device]?
 
   enum CodingKeys: String, CodingKey {
     case profile
     case displayName = "display_name"
     case state
     case selfName = "self"
+    case deviceName = "device_name"
     case ips
     case peers
     case authURL = "auth_url"
@@ -85,6 +123,7 @@ struct ProfileStatus: Decodable, Sendable, Identifiable {
     case adminURL = "admin_url"
     case prefs
     case exitNodeOptions = "exit_node_options"
+    case devices
   }
 
   var id: String { profile }
@@ -98,12 +137,31 @@ struct ProfileStatus: Decodable, Sendable, Identifiable {
     switch state {
     case "Running": return .running
     case "Starting": return .starting
-    case "NeedsLogin": return .needsLogin
+    case "NeedsLogin":
+      // An already-authenticated node reports NeedsLogin on every daemon start
+      // until its saved state loads, and a brand-new one sits here for ~25s
+      // before the control server issues a link. Neither is the user's problem
+      // to act on, so only an actual link means "needs login".
+      return authURL?.isEmpty == false ? .needsLogin : .starting
     default: return .stopped
     }
   }
 
   var name: String { displayName.isEmpty ? profile : displayName }
+
+  /// A configured-but-not-yet-reported tailnet. The config is the truth about
+  /// which tailnets exist; the daemon is only the truth about how they are
+  /// doing. Without this the UI claims you have none while it is starting.
+  static func placeholder(_ p: Profile) -> ProfileStatus {
+    ProfileStatus(
+      profile: p.name, displayName: p.displayName, state: "Stopped",
+      selfName: nil, deviceName: p.hostname, ips: nil, peers: 0, authURL: nil,
+      suffixes: p.suffixes, httpProxy: "127.0.0.1:\(p.httpProxyPort)",
+      socks5Proxy: "127.0.0.1:\(p.socks5ProxyPort)", error: nil,
+      tailnet: nil, magicDNSSuffix: nil, suffixConflict: nil, user: nil,
+      keyExpiry: nil, healthMessages: nil, adminURL: nil, prefs: nil,
+      exitNodeOptions: nil, devices: nil)
+  }
 
   /// `self` keeps the wire's trailing dot; nothing user-facing wants it.
   var machineName: String? {

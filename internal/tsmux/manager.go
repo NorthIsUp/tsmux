@@ -6,12 +6,15 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"tailscale.com/client/local"
@@ -26,6 +29,7 @@ import (
 type Node struct {
 	Profile *Profile
 	srv     *tsnet.Server
+	lock    *os.File
 
 	// The control server hands out the interactive login URL once and
 	// clears it from later status reads, so hold onto it until we are up.
@@ -60,6 +64,9 @@ func (n *Node) learned() (suffix, conflict string) {
 }
 
 type Manager struct {
+	// stop asks the daemon's own process to shut down; set by `tsmux up` so
+	// the GUI can stop a daemon it did not spawn instead of refusing to act.
+	stop    func()
 	cfg     *Config
 	verbose bool
 
@@ -72,6 +79,17 @@ func NewManager(cfg *Config, verbose bool) *Manager {
 }
 
 func (m *Manager) Config() *Config { return m.cfg }
+
+func (m *Manager) OnStop(f func()) { m.stop = f }
+
+// RequestStop triggers a graceful shutdown of the daemon process.
+func (m *Manager) RequestStop() bool {
+	if m.stop == nil {
+		return false
+	}
+	go m.stop()
+	return true
+}
 
 // Start brings up every profile. Nodes start concurrently; a profile that
 // still needs interactive login does not block the others.
@@ -107,6 +125,13 @@ func (m *Manager) startOne(ctx context.Context, p *Profile) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	// Two tsnet servers on one state dir clobber each other's credentials: the
+	// second writes prefs with an empty Persist over the first's node key, and
+	// the profile silently reverts to needing a login. Hold the dir exclusively.
+	lock, err := lockStateDir(dir)
+	if err != nil {
+		return fmt.Errorf("profile %s: %w", p.Name, err)
+	}
 	srv := &tsnet.Server{
 		Dir:        dir,
 		Hostname:   p.Hostname,
@@ -119,10 +144,11 @@ func (m *Manager) startOne(ctx context.Context, p *Profile) error {
 		srv.Logf = srv.UserLogf
 	}
 	if err := srv.Start(); err != nil {
+		lock.Close()
 		return fmt.Errorf("profile %s: %w", p.Name, err)
 	}
 	m.mu.Lock()
-	m.nodes[p.Name] = &Node{Profile: p, srv: srv}
+	m.nodes[p.Name] = &Node{Profile: p, srv: srv, lock: lock}
 	m.mu.Unlock()
 
 	if p.AcceptRoutes && firstRun {
@@ -284,11 +310,40 @@ func (m *Manager) Dial(ctx context.Context, network, hostport string) (net.Conn,
 	if err != nil {
 		return nil, err
 	}
-	return n.srv.Dial(ctx, network, hostport)
+	return n.Dial(ctx, network, hostport)
 }
 
+// Dial reaches hostport inside this node's tailnet, trying every address the
+// tailnet resolves, IPv4 first. tsnet otherwise commits to one address, and a
+// peer that advertises an unreachable IPv6 address fails outright even though
+// its IPv4 address works.
 func (n *Node) Dial(ctx context.Context, network, hostport string) (net.Conn, error) {
-	return n.srv.Dial(ctx, network, hostport)
+	host, port, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return n.srv.Dial(ctx, network, hostport)
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return n.srv.Dial(ctx, network, hostport)
+	}
+	ips, err := n.Resolve(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return n.srv.Dial(ctx, network, hostport)
+	}
+	sort.SliceStable(ips, func(i, j int) bool {
+		return ips[i].IP.To4() != nil && ips[j].IP.To4() == nil
+	})
+	var errs []string
+	for _, ip := range ips {
+		c, err := n.srv.Dial(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+		if err == nil {
+			return c, nil
+		}
+		errs = append(errs, fmt.Sprintf("%s: %v", ip.IP, err))
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, fmt.Errorf("%s: %s", host, strings.Join(errs, "; "))
 }
 
 // Resolve looks up a name using only this profile's tailnet DNS.
@@ -303,17 +358,20 @@ func (n *Node) Resolve(ctx context.Context, host string) ([]net.IPAddr, error) {
 }
 
 type Status struct {
-	Profile   string   `json:"profile"`
-	Display   string   `json:"display_name"`
-	State     string   `json:"state"`
-	Self      string   `json:"self,omitempty"`
-	IPs       []string `json:"ips,omitempty"`
-	Peers     int      `json:"peers"`
-	AuthURL   string   `json:"auth_url,omitempty"`
-	Suffixes  []string `json:"suffixes,omitempty"`
-	HTTPProxy string   `json:"http_proxy"`
-	SOCKS5    string   `json:"socks5_proxy"`
-	Err       string   `json:"error,omitempty"`
+	Profile string `json:"profile"`
+	Display string `json:"display_name"`
+	State   string `json:"state"`
+	Self    string `json:"self,omitempty"`
+	// DeviceName is the configured hostname this profile registers under; the
+	// editable half of Self, which the control server owns the rest of.
+	DeviceName string   `json:"device_name,omitempty"`
+	IPs        []string `json:"ips,omitempty"`
+	Peers      int      `json:"peers"`
+	AuthURL    string   `json:"auth_url,omitempty"`
+	Suffixes   []string `json:"suffixes,omitempty"`
+	HTTPProxy  string   `json:"http_proxy"`
+	SOCKS5     string   `json:"socks5_proxy"`
+	Err        string   `json:"error,omitempty"`
 
 	Tailnet        string           `json:"tailnet,omitempty"`
 	MagicDNSSuffix string           `json:"magic_dns_suffix,omitempty"`
@@ -324,6 +382,20 @@ type Status struct {
 	AdminURL       string           `json:"admin_url,omitempty"`
 	Prefs          *StatusPrefs     `json:"prefs,omitempty"`
 	ExitNodes      []ExitNodeOption `json:"exit_node_options,omitempty"`
+	Devices        []Device         `json:"devices,omitempty"`
+}
+
+// Device is one peer in the tailnet, for the GUI's device list. Owner and
+// Tags are what the UI groups by: a tagged node has no meaningful owner.
+type Device struct {
+	Name     string   `json:"name"`
+	Hostname string   `json:"hostname"`
+	IPs      []string `json:"ips,omitempty"`
+	OS       string   `json:"os,omitempty"`
+	Owner    string   `json:"owner,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	Online   bool     `json:"online"`
+	ExitNode bool     `json:"exit_node,omitempty"`
 }
 
 type StatusUser struct {
@@ -379,6 +451,7 @@ func (m *Manager) statusOf(ctx context.Context, n *Node) Status {
 	suffix, conflict := n.learned()
 	s := Status{
 		Profile: p.Name, Display: p.DisplayName, State: "Stopped",
+		DeviceName:     p.Hostname,
 		Suffixes:       m.cfg.SuffixesOf(p.Name),
 		HTTPProxy:      fmt.Sprintf("127.0.0.1:%d", p.HTTPPort),
 		SOCKS5:         fmt.Sprintf("127.0.0.1:%d", p.SOCKSPort),
@@ -414,6 +487,28 @@ func (m *Manager) statusOf(ctx context.Context, n *Node) Status {
 		}
 	}
 	for _, ps := range st.Peer {
+		d := Device{
+			Name:     strings.TrimSuffix(ps.DNSName, "."),
+			Hostname: ps.HostName,
+			OS:       ps.OS,
+			Online:   ps.Online,
+			ExitNode: ps.ExitNode,
+		}
+		for _, ip := range ps.TailscaleIPs {
+			d.IPs = append(d.IPs, ip.String())
+		}
+		if ps.Tags != nil {
+			for i := range ps.Tags.Len() {
+				d.Tags = append(d.Tags, ps.Tags.At(i))
+			}
+		}
+		if len(d.Tags) == 0 {
+			if u, ok := st.User[ps.UserID]; ok {
+				d.Owner = u.LoginName
+			}
+		}
+		s.Devices = append(s.Devices, d)
+
 		if !ps.ExitNodeOption {
 			continue
 		}
@@ -426,6 +521,7 @@ func (m *Manager) statusOf(ctx context.Context, n *Node) Status {
 		})
 	}
 	sort.Slice(s.ExitNodes, func(i, j int) bool { return s.ExitNodes[i].Name < s.ExitNodes[j].Name })
+	sort.Slice(s.Devices, func(i, j int) bool { return s.Devices[i].Name < s.Devices[j].Name })
 	if pr, err := lc.GetPrefs(ctx); err == nil {
 		s.Prefs = &StatusPrefs{
 			AcceptRoutes:     pr.RouteAll,
@@ -509,9 +605,27 @@ func (m *Manager) Close() error {
 		if e := n.srv.Close(); e != nil {
 			err = e
 		}
+		if n.lock != nil {
+			n.lock.Close()
+		}
 	}
 	m.nodes = map[string]*Node{}
 	return err
+}
+
+// lockStateDir takes an exclusive advisory lock on a profile's state
+// directory, held for the process lifetime. The lock is released by the
+// kernel if we are killed, so a crash does not strand it.
+func lockStateDir(dir string) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(dir, "tsmux.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("another tsmux is already running for this profile (state dir %s)", dir)
+	}
+	return f, nil
 }
 
 // pipe joins two conns and returns when either direction closes.

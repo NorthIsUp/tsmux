@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#MISE description="Rebuild TSMux.app and relaunch it on every source change"
+#MISE sources=["main.go", "internal/**/*.go", "macos/Sources/**/*.swift", "macos/Package.swift", "scripts/build-app.sh"]
+set -euo pipefail
+
+APP="${TSMUX_APP:-bin/TSMux.app}"
+
+# Shut down gracefully and WAIT. Killing the daemon mid-write is how a logged-in
+# profile comes back needing a login: signal it, then give it time to finish,
+# and only escalate if it genuinely hangs.
+wait_gone() { # pattern, seconds
+  local i=0
+  while pgrep -f "$1" >/dev/null 2>&1 && [ "$i" -lt "${2}0" ]; do sleep 0.1; i=$((i + 1)); done
+  ! pgrep -f "$1" >/dev/null 2>&1
+}
+
+if pgrep -f 'TSMux.app/Contents/MacOS' >/dev/null 2>&1; then
+  osascript -e 'tell application "TSMux" to quit' >/dev/null 2>&1 ||
+    pkill -TERM -f 'TSMux.app/Contents/MacOS' || true
+  wait_gone 'TSMux.app/Contents/MacOS' 10 || pkill -KILL -f 'TSMux.app/Contents/MacOS' || true
+fi
+
+if pgrep -f 'tsmux up' >/dev/null 2>&1; then
+  ./bin/tsmux down >/dev/null 2>&1 || pkill -TERM -f 'tsmux up' || true
+  wait_gone 'tsmux up' 15 || { echo "daemon did not exit; refusing to SIGKILL it" >&2; exit 1; }
+fi
+
+./scripts/build-app.sh "$APP" >/dev/null
+open "$APP"
+echo "rebuilt and relaunched $(date +%H:%M:%S)"

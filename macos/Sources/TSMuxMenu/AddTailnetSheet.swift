@@ -73,11 +73,13 @@ struct AddTailnetSheet: View {
           Text("profile: \(key)").font(.caption).foregroundStyle(.secondary)
         }
       }
-      DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
+      DisclosureGroup("Use a self-hosted control server", isExpanded: $showAdvanced) {
         VStack(alignment: .leading, spacing: 4) {
           TextField("https://headscale.example.com", text: $controlURL)
             .textFieldStyle(.roundedBorder)
-          Text("Leave blank for Tailscale.").font(.caption).foregroundStyle(.secondary)
+            .accessibilityLabel("Control server URL")
+          Text("For Headscale or another coordination server. Leave blank to use Tailscale.")
+            .font(.caption).foregroundStyle(.secondary)
         }
         .padding(.top, 4)
       }
@@ -119,7 +121,7 @@ struct AddTailnetSheet: View {
             .monospacedDigit()
         }
         Text(
-          "This takes about 30 seconds before the sign-in page can open. "
+          "This takes about 30 seconds before the sign-in page can open.\n\n"
             + "You can leave this window open — we'll take you to your browser "
             + "when it's ready."
         )

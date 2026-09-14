@@ -4,10 +4,12 @@ import Foundation
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
   let controller = Controller()
+  private var signalSources: [DispatchSourceSignal] = []
 
   // Documented ordering: the status item is created after launch finishes.
   func applicationDidFinishLaunching(_ notification: Notification) {
     controller.install()
+    installSignalHandlers()
     maybeShowFirstRun(notification)
   }
 
@@ -27,6 +29,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationWillTerminate(_ notification: Notification) {
     controller.shutdown()
+  }
+
+  /// AppKit only runs applicationWillTerminate for an orderly quit, so a plain
+  /// SIGTERM (pkill, a rebuild script, logout) would leave the daemon running
+  /// with the tailnets up and the ports held. Catch the signals ourselves and
+  /// route them through the same shutdown.
+  func installSignalHandlers() {
+    for sig in [SIGTERM, SIGINT, SIGHUP] {
+      signal(sig, SIG_IGN)  // the dispatch source is the handler now
+      let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+      src.setEventHandler { MainActor.assumeIsolated { NSApp.terminate(nil) } }
+      src.resume()
+      signalSources.append(src)
+    }
   }
 }
 

@@ -84,6 +84,14 @@ func (c *Config) LocalHandler(m *Manager) http.Handler {
 		defer cancel()
 		writeJSON(w, http.StatusOK, m.Status(ctx))
 	}, false))
+	mux.Handle("/shutdown", guard(func(w http.ResponseWriter, r *http.Request) {
+		if !m.RequestStop() {
+			writeJSON(w, http.StatusServiceUnavailable,
+				map[string]string{"error": "this daemon cannot stop itself"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "stopping"})
+	}, true))
 	mux.Handle("/prefs", guard(func(w http.ResponseWriter, r *http.Request) {
 		var req PrefsRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -199,6 +207,24 @@ func (c *Config) PostPrefs(req PrefsRequest) (Status, error) { return c.post("/p
 
 func (c *Config) PostLogout(profile string) (Status, error) {
 	return c.post("/logout", PrefsRequest{Profile: profile})
+}
+
+// Shutdown asks a running daemon to exit, whoever started it.
+func (c *Config) Shutdown() error {
+	cl := &http.Client{Timeout: 3 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, "http://"+c.Router.PACListen+"/shutdown", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return fmt.Errorf("tsmux daemon is not running")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("daemon refused to stop (%s)", resp.Status)
+	}
+	return nil
 }
 
 func (c *Config) post(path string, body any) (Status, error) {

@@ -10,7 +10,7 @@ struct AccountsTab: View {
 
   var body: some View {
     Group {
-      if model.profiles.isEmpty {
+      if model.displayProfiles.isEmpty {
         emptyState
       } else {
         split
@@ -62,7 +62,7 @@ struct AccountsTab: View {
     VStack(spacing: 0) {
       List(selection: selectionBinding) {
         Section {
-          ForEach(model.profiles) { p in
+          ForEach(model.displayProfiles) { p in
             row(p).tag(p.profile)
           }
         } header: {
@@ -100,10 +100,11 @@ struct AccountsTab: View {
   }
 
   private var connectedSummary: String {
-    let up = model.profiles.filter { $0.condition == .running }.count
+    let up = model.displayProfiles.filter { $0.condition == .running }.count
     if up == 0 { return "none connected yet" }
-    return up == model.profiles.count && up > 1
-      ? "\(up) connected, all at once" : "\(up) of \(model.profiles.count) connected"
+    return up == model.displayProfiles.count && up > 1
+      ? "\(up) connected, all at once"
+      : "\(up) of \(model.displayProfiles.count) connected"
   }
 
   private var selectionBinding: Binding<String?> {
@@ -121,7 +122,7 @@ struct AccountsTab: View {
           .font(.caption)
           .foregroundStyle(.secondary)
           .lineLimit(1)
-        if model.profiles.count > 1, let proxy = p.httpProxy,
+        if model.displayProfiles.count > 1, let proxy = p.httpProxy,
           let port = proxy.split(separator: ":")
             .last
         {
@@ -204,9 +205,7 @@ struct AccountDetail: View {
           }
         }
       }
-      if let machine = profile.machineName {
-        LabeledContent("Machine") { CopyableValue(value: machine) }
-      }
+      MachineNameRow(model: model, profile: profile)
       if let ips = profile.ips, !ips.isEmpty {
         LabeledContent("Addresses") {
           VStack(alignment: .trailing, spacing: 2) {
@@ -361,5 +360,73 @@ struct AccountDetail: View {
         Button("Remove Tailnet…") { showRemove = true }
       }
     }
+  }
+}
+
+/// The device name is the one part of the machine name you own — the control
+/// server appends the tailnet's domain. tsnet fixes it when the node is
+/// created, so a rename needs that profile's node restarted.
+private struct MachineNameRow: View {
+  let model: AppModel
+  let profile: ProfileStatus
+
+  @State private var draft = ""
+  @State private var editing = false
+  @State private var error: String?
+
+  private var configured: String { profile.deviceName ?? "" }
+  private var changed: Bool {
+    let d = draft.trimmingCharacters(in: .whitespaces)
+    return !d.isEmpty && d != configured
+  }
+
+  var body: some View {
+    LabeledContent("Machine") {
+      VStack(alignment: .trailing, spacing: 4) {
+        if editing {
+          HStack(spacing: 6) {
+            TextField("device name", text: $draft)
+              .textFieldStyle(.roundedBorder)
+              .frame(width: 180)
+              .onSubmit { if changed { rename() } }
+            Button("Rename") { rename() }.disabled(!changed)
+            Button("Cancel") {
+              editing = false
+              error = nil
+            }
+          }
+        } else {
+          HStack(spacing: 6) {
+            CopyableValue(value: profile.machineName ?? configured)
+            Button {
+              draft = configured
+              editing = true
+            } label: {
+              Image(systemName: "pencil")
+            }
+            .buttonStyle(.borderless)
+            .help("Rename this device")
+          }
+        }
+        if let error {
+          Text(error).font(.caption).foregroundStyle(.red)
+        }
+      }
+    }
+  }
+
+  /// mutateProfiles stops and restarts the daemon around the change, which is
+  /// what makes the new name take effect instead of waiting for a manual restart.
+  private func rename() {
+    let name = draft.trimmingCharacters(in: .whitespaces)
+    let (_, err, code) = model.mutateProfiles {
+      CLI.run(["profile", "set", profile.profile, "--hostname", name])
+    }
+    if code != 0 {
+      error = err.isEmpty ? "Rename failed." : err
+      return
+    }
+    error = nil
+    editing = false
   }
 }

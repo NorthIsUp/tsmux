@@ -37,6 +37,13 @@ final class AppModel {
   /// `profile list` — the YAML view. Needed for fields `/status` does not
   /// carry (match_root), and as the launch probe.
   var configProfiles: [Profile] = []
+
+  /// What the UI lists. Falls back to the configured tailnets whenever the
+  /// daemon has not reported yet, so "no tailnets" means the config is empty
+  /// and never "the daemon is still starting".
+  var displayProfiles: [ProfileStatus] {
+    profiles.isEmpty ? configProfiles.map(ProfileStatus.placeholder) : profiles
+  }
   var configState: ConfigState = .configured
   var startDeadline: Date?
   var crashLine: String?
@@ -60,6 +67,7 @@ final class AppModel {
   // MARK: defaults
 
   static let pacKey = "pacApplied"
+  static let pacAutoKey = "pacAuto"
   static let hideDockKey = "hideDockIcon"
   static let connectAtLaunchKey = "connectAtLaunch"
   static let didShowFirstRunKey = "didShowFirstRun"
@@ -115,7 +123,8 @@ final class AppModel {
   }
 
   var selection: ProfileStatus? {
-    profiles.first { $0.profile == selectedProfile } ?? profiles.first
+    let list = displayProfiles
+    return list.first { $0.profile == selectedProfile } ?? list.first
   }
 
   // MARK: launch
@@ -162,9 +171,15 @@ final class AppModel {
   private func apply(_ next: StatusResult) {
     refreshing = false
     status = next
-    if case .ok = next {
+    if case .ok(let ps) = next {
       startDeadline = nil
       crashLine = nil
+      // The product promise is that a tailnet name just resolves. Requiring a
+      // menu click for that is the whole problem, so route by default once a
+      // tailnet is actually up — and stop if the user ever turns it off.
+      if pacAuto, !pacApplied, ps.contains(where: { $0.condition == .running }) {
+        applyPAC(auto: true)
+      }
     } else if let deadline = startDeadline, Date() > deadline {
       startDeadline = nil
       if crashLine == nil {
@@ -245,15 +260,28 @@ final class AppModel {
     stopDaemon()
   }
 
+  /// Stops whatever daemon is up, not just one we spawned: a daemon started
+  /// from a terminal still holds the profiles, and refusing to act on it turns
+  /// an ordinary "remove this tailnet" into an error the user cannot clear.
   private func stopDaemon() {
-    guard let d = daemon, d.isRunning else { return }
     if pacApplied { restorePAC(silent: false) }
-    expectingExit = true
-    d.terminate()
+    if let d = daemon, d.isRunning {
+      expectingExit = true
+      d.terminate()
+      let deadline = Date().addingTimeInterval(5)
+      while d.isRunning && Date() < deadline { usleep(50_000) }
+    } else {
+      _ = CLI.run(["down"], timeout: 10)
+    }
     daemon = nil
     startDeadline = nil
-    let deadline = Date().addingTimeInterval(5)
-    while d.isRunning && Date() < deadline { usleep(50_000) }
+    // The process being gone is not the same as the port being free; the CLI
+    // refuses to mutate while /status still answers.
+    let deadline = Date().addingTimeInterval(8)
+    while Date() < deadline {
+      if case .daemonDown = CLI.status() { break }
+      usleep(100_000)
+    }
     status = .daemonDown
     notify()
   }
@@ -261,7 +289,8 @@ final class AppModel {
   /// `profile add`/`rm` cannot run against a live daemon (D5), so bracket them.
   @discardableResult
   func mutateProfiles<T>(_ body: () -> T) -> T {
-    let wasRunning = weOwnDaemon
+    // Any live daemon blocks the mutation, whether or not we started it.
+    let wasRunning = daemonRunning
     let countBefore = configProfiles.count
     if wasRunning { stopDaemon() }
     let result = body()
@@ -282,11 +311,20 @@ final class AppModel {
 
   // MARK: PAC
 
+  /// Off by hand means off: an automatic re-apply on the next poll would be
+  /// the app arguing with the user.
+  var pacAuto: Bool {
+    get { (UserDefaults.standard.object(forKey: Self.pacAutoKey) as? Bool) ?? true }
+    set { UserDefaults.standard.set(newValue, forKey: Self.pacAutoKey) }
+  }
+
   func togglePAC() {
     if pacApplied {
+      pacAuto = false
       restorePAC(silent: false)
       return
     }
+    pacAuto = true
     if !pacConfirmed {
       let a = NSAlert()
       a.messageText = "Route system traffic through tsmux?"
@@ -297,10 +335,15 @@ final class AppModel {
       guard a.runModal() == .alertFirstButtonReturn else { return }
       pacConfirmed = true
     }
+    applyPAC(auto: false)
+  }
+
+  private func applyPAC(auto: Bool) {
     let (_, err, code) = CLI.run(["pac", "apply"], timeout: nil)
     if code == 0 {
       pacApplied = true
-    } else {
+      notify()
+    } else if !auto {
       Alert.show("Could not route system traffic", CLI.message(err))
     }
   }

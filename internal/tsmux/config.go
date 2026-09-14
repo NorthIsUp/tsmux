@@ -84,6 +84,17 @@ type Profile struct {
 // fallback is enabled. Kept as a method so routing has one entry point.
 var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$`)
 
+// hostnameRE is what a tailnet accepts as a device name: a DNS label.
+var hostnameRE = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
+
+// ValidateHostname rejects names the control server would mangle or refuse.
+func ValidateHostname(h string) error {
+	if !hostnameRE.MatchString(h) {
+		return fmt.Errorf("machine name %q must be 1-63 letters, digits or dashes, and cannot start or end with a dash", h)
+	}
+	return nil
+}
+
 func Default() *Config {
 	return &Config{
 		Version: 1,
@@ -265,12 +276,9 @@ func (c *Config) Normalize() error {
 		// Non-nil so the JSON contract is always an array, never null.
 		clean := []string{}
 		for _, s := range p.Suffixes {
-			s = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), "."))
-			if s == "" {
+			s = normalizeSuffix(s)
+			if s == "" || s == "." {
 				continue
-			}
-			if !strings.HasPrefix(s, ".") {
-				s = "." + s
 			}
 			clean = append(clean, s)
 		}
@@ -401,4 +409,63 @@ func (c *Config) Save(path string) error {
 		return err
 	}
 	return nil
+}
+
+// normalizeSuffix lowercases a DNS suffix and gives it the leading dot the
+// routing table matches on.
+func normalizeSuffix(s string) string {
+	s = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), "."))
+	if s == "" {
+		return ""
+	}
+	if !strings.HasPrefix(s, ".") {
+		s = "." + s
+	}
+	return s
+}
+
+// ClaimSuffix adds a DNS suffix to one profile, reporting the existing owner
+// if another profile already claims it. Claims must stay unique: two profiles
+// owning one suffix makes routing non-deterministic.
+func (c *Config) ClaimSuffix(profile, suffix string) (owner string, err error) {
+	s := normalizeSuffix(suffix)
+	if s == "." || s == "" {
+		return "", fmt.Errorf("%q is not a usable DNS suffix", suffix)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.Profiles[profile]
+	if !ok {
+		return "", fmt.Errorf("no profile %q", profile)
+	}
+	for _, other := range c.sorted {
+		if other.Name == profile {
+			continue
+		}
+		if slices.Contains(other.Suffixes, s) {
+			return other.Name, nil
+		}
+	}
+	if !slices.Contains(p.Suffixes, s) {
+		p.Suffixes = append(p.Suffixes, s)
+		sort.Strings(p.Suffixes)
+	}
+	return "", nil
+}
+
+// ReleaseSuffix drops a claim, reporting whether the profile held it.
+func (c *Config) ReleaseSuffix(profile, suffix string) bool {
+	s := normalizeSuffix(suffix)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.Profiles[profile]
+	if !ok {
+		return false
+	}
+	i := slices.Index(p.Suffixes, s)
+	if i < 0 {
+		return false
+	}
+	p.Suffixes = append(p.Suffixes[:i], p.Suffixes[i+1:]...)
+	return true
 }

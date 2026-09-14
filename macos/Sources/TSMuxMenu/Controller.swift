@@ -189,14 +189,14 @@ final class Controller: NSObject, NSMenuDelegate {
     }
 
     // 2. attention row
-    if let p = model.profiles.first(where: { $0.condition == .needsLogin }) {
-      if let url = p.authURL, !url.isEmpty {
-        let mi = action("Log in to \(p.name)…", #selector(openLogin(_:)))
-        mi.representedObject = url
-        menu.addItem(mi)
-      } else {
-        menu.addItem(disabled("Waiting for login link…"))
-      }
+    // .needsLogin now implies a usable link — a node still acquiring one reads
+    // as .starting, so there is no link-less case to render here.
+    if let p = model.profiles.first(where: { $0.condition == .needsLogin }),
+      let url = p.authURL, !url.isEmpty
+    {
+      let mi = action("Log in to \(p.name)…", #selector(openLogin(_:)))
+      mi.representedObject = url
+      menu.addItem(mi)
     }
 
     menu.addItem(.separator())
@@ -270,6 +270,64 @@ final class Controller: NSObject, NSMenuDelegate {
     return top
   }
 
+  /// Devices submenu. Each device is three stacked items sharing one slot:
+  /// plain copies the URL, Option the IP, Shift-Option the short name. AppKit
+  /// swaps them as the modifiers change, so the menu shows only one at a time.
+  private func addDevices(_ p: ProfileStatus, to sub: NSMenu) {
+    let devices = p.devices ?? []
+    guard !devices.isEmpty else {
+      sub.addItem(disabled("\(p.peers ?? 0) peers"))
+      return
+    }
+    let root = NSMenuItem(title: "Devices (\(devices.count))", action: nil, keyEquivalent: "")
+    let menu = NSMenu()
+    menu.autoenablesItems = false
+
+    // Tagged groups after people, each alphabetical; within a group the
+    // reachable devices come first, since those are the ones you can act on.
+    let groups = Dictionary(grouping: devices, by: \.group)
+    let ordered = groups.keys.sorted { a, b in
+      let at = a.hasPrefix("tag:")
+      let bt = b.hasPrefix("tag:")
+      return at == bt ? a.localizedStandardCompare(b) == .orderedAscending : !at
+    }
+    for (i, key) in ordered.enumerated() {
+      if i > 0 { menu.addItem(.separator()) }
+      menu.addItem(disabled(key))
+      let sorted = (groups[key] ?? []).sorted {
+        $0.online == $1.online
+          ? $0.shortName.localizedStandardCompare($1.shortName) == .orderedAscending
+          : $0.online
+      }
+      for d in sorted { addDeviceVariants(d, to: menu) }
+    }
+    root.submenu = menu
+    sub.addItem(root)
+  }
+
+  private func addDeviceVariants(_ d: Device, to menu: NSMenu) {
+    let dot = d.online ? "🟢" : "⚪️"
+    let exit = d.exitNode == true ? "  ⇥" : ""
+    let variants: [(String, String?)] = [
+      ("\(dot)  \(d.shortName)\(exit)", d.url),
+      ("\(dot)  \(d.shortName)\(exit)  — copy IP", d.primaryIP),
+      ("\(dot)  \(d.shortName)\(exit)  — copy name", d.shortName),
+    ]
+    let masks: [NSEvent.ModifierFlags] = [[], [.option], [.option, .shift]]
+    for (i, v) in variants.enumerated() {
+      let mi = NSMenuItem(title: v.0, action: #selector(copyValue(_:)), keyEquivalent: "")
+      mi.target = self
+      mi.keyEquivalentModifierMask = masks[i]
+      mi.isAlternate = i > 0
+      mi.isEnabled = v.1 != nil
+      mi.representedObject = v.1
+      mi.toolTip = [d.name, d.primaryIP, d.os].compactMap { $0 }.joined(separator: " · ")
+      mi.setAccessibilityLabel(
+        "\(d.shortName), \(d.online ? "online" : "offline")")
+      menu.addItem(mi)
+    }
+  }
+
   private func profileItem(_ p: ProfileStatus) -> NSMenuItem {
     let (symbol, color, label) = Self.appearance(p.condition, state: p.state)
     let top = NSMenuItem(title: "\(p.name) — \(label)", action: nil, keyEquivalent: "")
@@ -312,7 +370,7 @@ final class Controller: NSObject, NSMenuDelegate {
       mi.representedObject = ip
       sub.addItem(mi)
     }
-    sub.addItem(disabled("\(p.peers ?? 0) peers"))
+    addDevices(p, to: sub)
     sub.addItem(.separator())
 
     let http = p.httpProxy ?? ""
