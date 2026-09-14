@@ -194,7 +194,13 @@ func (m *Manager) watch(ctx context.Context, name string, srv *tsnet.Server) {
 					m.learnSuffix(n, want)
 				}
 				tick = 5 * time.Second
-			case "NeedsLogin", "NoState":
+			case "NoState":
+				// Still loading. The backend re-registers with the stored node
+				// key here, and asking for an interactive login during this
+				// window throws that key away for a brand new one — which
+				// control can only authorize through a browser. Wait.
+				learned = ""
+			case "NeedsLogin":
 				learned = ""
 				switch {
 				case st.AuthURL != "":
@@ -205,10 +211,13 @@ func (m *Manager) watch(ctx context.Context, name string, srv *tsnet.Server) {
 					}
 					n.setAuthURL(st.AuthURL)
 				default:
-					// The control server hands the URL out once; ask again if
-					// we have seen two empty polls in a row.
-					if emptyRuns++; emptyRuns >= 2 && n.AuthURL() == "" {
+					// A login URL arrives on its own; StartLoginInteractive is
+					// a last resort because it regenerates the node key. Only
+					// ask after the backend has sat in NeedsLogin with no URL
+					// long enough that nothing is in flight.
+					if emptyRuns++; emptyRuns >= 10 && n.AuthURL() == "" {
 						emptyRuns = 0
+						log.Printf("[%s] no login URL after %ds; requesting one", name, emptyRuns)
 						_ = lc.StartLoginInteractive(ctx)
 					}
 				}
