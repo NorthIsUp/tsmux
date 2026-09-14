@@ -1,0 +1,7 @@
+[tools]
+go = "1.27"
+# pinned to match the package version hk.pkl amends
+hk = "1.58.1"
+pkl = "0.31"
+actionlint = "latest"
+shellcheck = "latest"

@@ -1,0 +1,154 @@
+name: release
+
+# Single source of truth for the version is the VERSION file at the repo root
+# (scripts/build-app.sh reads the same file for -ldflags). Bump it with
+# `mise run bump-patch|bump-minor|bump-major`; landing that bump on main tags
+# v<version> and publishes the release.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: v
+        name: Detect version bump
+        run: |
+          version=$(tr -d '[:space:]' < VERSION)
+          # Guard the tag name: a malformed VERSION would otherwise tag garbage.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "VERSION is not a bare semver: '$version'" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version already tagged; nothing to release"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version is new; releasing"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  binaries:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      # Pure-Go (CGO off), so every target cross-compiles from one runner.
+      - name: Cross-compile
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          mkdir -p dist
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+            goos=${target%/*}
+            goarch=${target#*/}
+            echo "==> $goos/$goarch"
+            GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+              -o "dist/tsmux-$goos-$goarch" .
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/tsmux-*
+          if-no-files-found: error
+
+  app:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: Build TSMux.app
+        run: ./scripts/build-app.sh
+
+      # ditto preserves the bundle's symlinks and the ad-hoc signature; `zip` does not.
+      - name: Zip TSMux.app
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent bin/TSMux.app "dist/TSMux-$VERSION-macos.zip"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: dist/TSMux-*-macos.zip
+          if-no-files-found: error
+
+  release:
+    needs: [check, binaries, app]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum tsmux-* TSMux-*-macos.zip > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check.outputs.version }}
+          name: v${{ needs.check.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            Download the `tsmux` binary for your platform, verify it against
+            `checksums-sha256.txt`, then `chmod +x` it and put it on your `PATH`.
+
+            ## macOS menu bar app
+
+            `TSMux-${{ needs.check.outputs.version }}-macos.zip` is **ad-hoc signed and
+            not notarized**. macOS Gatekeeper will refuse to open it on first launch.
+            Either right-click the app and choose *Open*, or clear the quarantine flag:
+
+            ```sh
+            xattr -dr com.apple.quarantine /Applications/TSMux.app
+            ```
+          files: |
+            dist/tsmux-*
+            dist/TSMux-*-macos.zip
+            dist/checksums-sha256.txt
+          fail_on_unmatched_files: true

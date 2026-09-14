@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Run every hk linter over all files and apply fixes"
+set -euo pipefail
+
+hk fix --all "$@"

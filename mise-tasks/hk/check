@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Run every hk linter over all files (read-only)"
+set -euo pipefail
+
+hk check --all "$@"

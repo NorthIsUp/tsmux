@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Run the Go test suite with -race (matches CI)"
+set -euo pipefail
+
+go test -race ./...

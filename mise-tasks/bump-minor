@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Bump the minor version in VERSION (land on main to release)"
+set -euo pipefail
+
+./scripts/bump.sh minor

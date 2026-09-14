@@ -126,3 +126,25 @@ macOS system-proxy apply/restore, tunnels, SSH, profile-scoped DNS, doctor.
 
 Not built: a menu-bar GUI, Linux/Windows system-proxy integration (use the PAC
 URL directly), and a background service wrapper.
+
+## Releasing
+
+`VERSION` at the repo root is the single source of truth. Both
+`scripts/build-app.sh` (via `-ldflags -X main.version=…`) and
+`.github/workflows/release.yml` read it; nothing else stores the version.
+
+```sh
+mise run bump-patch   # or bump-minor / bump-major
+```
+
+Land the bump on `main` and the release workflow tags `v<version>`, builds
+`tsmux` for darwin/linux × arm64/amd64 plus a zipped `TSMux.app`, and publishes
+a GitHub release with SHA256 checksums. If `VERSION` is unchanged the workflow
+is a no-op, so ordinary commits to `main` do not release.
+
+`TSMux.app` in the release is ad-hoc signed and **not notarized** — clear the
+quarantine flag after installing:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/TSMux.app
+```

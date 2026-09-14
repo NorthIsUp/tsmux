@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Build the tsmux binary into bin/"
+set -euo pipefail
+
+# rm first: build-app.sh leaves a lipo universal binary here and `go build -o`
+# refuses to overwrite a file it doesn't recognise as its own output.
+rm -f bin/tsmux
+go build -o bin/tsmux .

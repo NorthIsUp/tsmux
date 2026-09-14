@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Format Go sources in place with gofmt -s"
+set -euo pipefail
+
+gofmt -s -w .

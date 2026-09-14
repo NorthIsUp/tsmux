@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#MISE description="Go format-check and vet (matches CI)"
+set -euo pipefail
+
+unformatted="$(gofmt -s -l .)"
+if [ -n "$unformatted" ]; then
+  echo "$unformatted"
+  echo "run 'mise run fmt' to fix" >&2
+  exit 1
+fi
+
+go vet ./...

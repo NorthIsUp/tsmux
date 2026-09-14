@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Build bin/TSMux.app (universal menu bar app + bundled CLI)"
+set -euo pipefail
+
+./scripts/build-app.sh "$@"

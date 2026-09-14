@@ -1,22 +1,50 @@
 name: ci
+
 on:
   push:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          persist-credentials: false
+
+      # mise installs the toolchain pinned in mise.toml and puts mise-tasks/ on
+      # the task list, so every step below is the same recipe a dev runs locally.
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
           cache: true
-      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      - run: go vet ./...
-      - run: go test -race ./...
-      - run: go build ./...
+
+      - name: lint
+        run: mise run lint
+
+      - name: test
+        run: mise run test
+
+      - name: build
+        run: mise run build
+
+      # The menu bar app only builds on macOS; keep it in the same pipeline so a
+      # Swift break fails CI rather than surfacing at release time.
+      - name: swift build
+        if: runner.os == 'macOS'
+        working-directory: macos
+        run: swift build -c release
+
+      # Everything the steps above don't cover (swift-format, actionlint, pkl,
+      # trailing whitespace). macOS only: swift-format ships with Xcode.
+      - name: hk check
+        if: runner.os == 'macOS'
+        run: mise run hk:check
