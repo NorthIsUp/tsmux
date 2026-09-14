@@ -31,6 +31,11 @@ func (c *Config) Route(hostport string) (*Match, error) {
 		return nil, fmt.Errorf("empty host")
 	}
 
+	// D4: Suffixes are appended by the watch goroutine when a node learns its
+	// MagicDNS suffix, so every read of them is under the config lock.
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	if ip, err := netip.ParseAddr(host); err == nil {
 		for _, p := range c.sorted {
 			for _, pfx := range p.routes {

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -28,6 +29,11 @@ type Config struct {
 	path    string
 	sorted  []*Profile
 	tunnels []*Tunnel
+
+	// ponytail: one config-wide RWMutex; split it if dial rates ever notice.
+	// Guards the mutable part of a loaded config: the suffix lists, which the
+	// daemon appends to when it learns a tailnet's MagicDNS suffix.
+	mu sync.RWMutex
 }
 
 type Router struct {
@@ -59,17 +65,17 @@ type Tunnel struct {
 }
 
 type Profile struct {
-	Name         string   `yaml:"-"`
-	DisplayName  string   `yaml:"display_name"`
-	Hostname     string   `yaml:"hostname"`
-	AuthKeyEnv   string   `yaml:"auth_key_env"`
-	ControlURL   string   `yaml:"control_url"`
-	AcceptRoutes bool     `yaml:"accept_routes"`
-	Suffixes     []string `yaml:"suffixes"`
-	MatchRoot    bool     `yaml:"match_root"`
-	IPRoutes     []string `yaml:"ip_routes"`
-	HTTPPort     int      `yaml:"http_proxy_port"`
-	SOCKSPort    int      `yaml:"socks5_proxy_port"`
+	Name         string   `yaml:"-" json:"name"`
+	DisplayName  string   `yaml:"display_name" json:"display_name"`
+	Hostname     string   `yaml:"hostname" json:"hostname"`
+	AuthKeyEnv   string   `yaml:"auth_key_env" json:"-"`
+	ControlURL   string   `yaml:"control_url" json:"control_url"`
+	AcceptRoutes bool     `yaml:"accept_routes" json:"accept_routes"`
+	Suffixes     []string `yaml:"suffixes" json:"suffixes"`
+	MatchRoot    bool     `yaml:"match_root" json:"match_root"`
+	IPRoutes     []string `yaml:"ip_routes" json:"ip_routes"`
+	HTTPPort     int      `yaml:"http_proxy_port" json:"http_proxy_port"`
+	SOCKSPort    int      `yaml:"socks5_proxy_port" json:"socks5_proxy_port"`
 
 	routes []netip.Prefix
 }
@@ -209,8 +215,26 @@ func (c *Config) Normalize() error {
 	}
 	sort.Strings(names)
 
+	// Ports already pinned in the file are reserved first, so adding a profile
+	// that sorts before an existing one cannot steal its port.
+	usedHTTP, usedSOCKS := map[int]bool{}, map[int]bool{}
+	for _, p := range c.Profiles {
+		if p == nil {
+			continue
+		}
+		usedHTTP[p.HTTPPort], usedSOCKS[p.SOCKSPort] = true, true
+	}
+	nextPort := func(used map[int]bool, base int) int {
+		for port := base; ; port += 2 {
+			if !used[port] {
+				used[port] = true
+				return port
+			}
+		}
+	}
+
 	c.sorted, c.tunnels = c.sorted[:0], c.tunnels[:0]
-	for i, n := range names {
+	for _, n := range names {
 		p := c.Profiles[n]
 		if p == nil {
 			p = &Profile{}
@@ -226,13 +250,11 @@ func (c *Config) Normalize() error {
 		if p.Hostname == "" {
 			p.Hostname = c.Router.ProfileHostnameBase + "-" + n
 		}
-		// Stable allocation: ports track sorted position, so PAC output and
-		// per-profile browser settings survive unrelated config edits.
 		if p.HTTPPort == 0 {
-			p.HTTPPort = c.Router.ProfileHTTPBase + 2*i
+			p.HTTPPort = nextPort(usedHTTP, c.Router.ProfileHTTPBase)
 		}
 		if p.SOCKSPort == 0 {
-			p.SOCKSPort = c.Router.ProfileSOCKSBase + 2*i
+			p.SOCKSPort = nextPort(usedSOCKS, c.Router.ProfileSOCKSBase)
 		}
 		if p.ControlURL != "" {
 			u, err := url.Parse(p.ControlURL)
@@ -240,7 +262,8 @@ func (c *Config) Normalize() error {
 				return fmt.Errorf("profile %q: bad control_url %q", n, p.ControlURL)
 			}
 		}
-		clean := p.Suffixes[:0]
+		// Non-nil so the JSON contract is always an array, never null.
+		clean := []string{}
 		for _, s := range p.Suffixes {
 			s = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), "."))
 			if s == "" {
@@ -252,6 +275,9 @@ func (c *Config) Normalize() error {
 			clean = append(clean, s)
 		}
 		p.Suffixes = clean
+		if p.IPRoutes == nil {
+			p.IPRoutes = []string{}
+		}
 		p.routes = nil
 		for _, r := range p.IPRoutes {
 			pfx, err := netip.ParsePrefix(strings.TrimSpace(r))
@@ -304,8 +330,35 @@ func (c *Config) checkListen(addr string) error {
 	return nil
 }
 
-// Ordered returns profiles in stable (sorted) order.
+// Ordered returns profiles in stable (sorted) order. Lock-free: the slice and
+// its members are fixed after Normalize; only Suffixes mutate, and readers of
+// those go through SuffixesOf.
 func (c *Config) Ordered() []*Profile { return c.sorted }
+
+// SuffixesOf returns a copy of a profile's suffixes, safe against the daemon
+// learning a new one mid-flight.
+func (c *Config) SuffixesOf(name string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	p, ok := c.Profiles[name]
+	if !ok || len(p.Suffixes) == 0 {
+		return nil
+	}
+	return slices.Clone(p.Suffixes)
+}
+
+// addSuffix appends a suffix to the live config so routing and PAC pick it up
+// in the session that learned it. Caller supplies an already-normalized
+// ".lowercase.suffix".
+func (c *Config) addSuffix(name, suffix string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.Profiles[name]
+	if !ok || slices.Contains(p.Suffixes, suffix) {
+		return
+	}
+	p.Suffixes = append(p.Suffixes, suffix)
+}
 
 func (c *Config) StateDir(profile string) string {
 	return filepath.Join(c.Paths.StateDir, "profiles", profile)
@@ -332,9 +385,20 @@ func (c *Config) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	c.mu.RLock()
 	b, err := yaml.Marshal(c)
+	c.mu.RUnlock()
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+	// Atomic: a crash mid-write must not leave a truncated config behind.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }

@@ -1,6 +1,9 @@
 package tsmux
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func cfg(t *testing.T) *Config {
 	t.Helper()
@@ -70,4 +73,22 @@ func TestStablePorts(t *testing.T) {
 	if got := c.Profiles["work"].SOCKSPort; got != 43115 {
 		t.Errorf("work socks port = %d, want 43115", got)
 	}
+}
+
+// D4: Route ranges over Suffixes while the watch goroutine appends to them.
+func TestRouteConcurrentSuffixLearn(t *testing.T) {
+	c := cfg(t)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 200 {
+			c.addSuffix("home", fmt.Sprintf(".learned%d.ts.net", i))
+		}
+	}()
+	for range 200 {
+		if _, err := c.Route("box.work.ts.net"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	<-done
 }

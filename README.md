@@ -63,7 +63,10 @@ one tailnet: point it at `127.0.0.1:43110` and it only ever sees that tailnet.
 
 ## Configuration
 
-`~/.config/tsmux/config.yaml`:
+`~/.config/tsmux/config.yaml`. tsmux owns this file and rewrites it (when you
+add a profile, or when it learns a tailnet's DNS suffix at first login), so
+comments are not preserved. `suffixes` is optional: leave it out and tsmux
+fills it in once the profile logs in.
 
 ```yaml
 version: 1

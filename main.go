@@ -55,6 +55,16 @@ func root() *cobra.Command {
 
 func load() (*tsmux.Config, error) { return tsmux.Load(cfgPath) }
 
+// loadOrDefault treats "no config file yet" as an empty config, so the GUI's
+// launch probe and the first `profile add` do not have to special-case it.
+func loadOrDefault() (*tsmux.Config, error) {
+	cfg, err := load()
+	if errors.Is(err, os.ErrNotExist) {
+		return tsmux.Default(), nil
+	}
+	return cfg, err
+}
+
 func emit(v any, plain func()) {
 	if outputJSON {
 		e := json.NewEncoder(os.Stdout)
@@ -167,11 +177,7 @@ func cmdUp() *cobra.Command {
 				return fmt.Errorf("pac server: %w", err)
 			}
 			closers = append(closers, func() { pl.Close() })
-			go (&http.Server{Handler: cfg.LocalHandler(func() any {
-				sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer scancel()
-				return m.Status(sctx)
-			})}).Serve(pl)
+			go (&http.Server{Handler: cfg.LocalHandler(m)}).Serve(pl)
 			log.Printf("%-12s %s", "pac", cfg.PACURL())
 			log.Printf("%-12s %s", "status", cfg.StatusURL())
 
@@ -298,11 +304,14 @@ func cmdProfile() *cobra.Command {
 	c.AddCommand(&cobra.Command{
 		Use: "list", Short: "List configured profiles",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			cfg, err := load()
+			cfg, err := loadOrDefault()
 			if err != nil {
 				return err
 			}
-			emit(cfg.Ordered(), func() {
+			// Always a JSON array, never null: the GUI's launch probe reads
+			// [] as "first run".
+			list := append([]*tsmux.Profile{}, cfg.Ordered()...)
+			emit(list, func() {
 				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 				fmt.Fprintln(w, "PROFILE\tHOSTNAME\tHTTP\tSOCKS5\tSUFFIXES")
 				for _, p := range cfg.Ordered() {
@@ -315,28 +324,26 @@ func cmdProfile() *cobra.Command {
 	})
 
 	var suffixes []string
-	var control, authEnv string
+	var control, authEnv, displayName string
 	var matchRoot bool
 	add := &cobra.Command{
 		Use: "add <name>", Short: "Add a profile to the config", Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			cfg, err := load()
+			cfg, err := loadOrDefault()
 			if err != nil {
-				if !errors.Is(err, os.ErrNotExist) {
-					return err
-				}
-				cfg = tsmux.Default()
+				return err
 			}
 			if _, ok := cfg.Profiles[args[0]]; ok {
 				return fmt.Errorf("profile %q already exists", args[0])
 			}
 			cfg.Profiles[args[0]] = &tsmux.Profile{
-				Suffixes: suffixes, ControlURL: control, AuthKeyEnv: authEnv, MatchRoot: matchRoot,
+				DisplayName: displayName, Suffixes: suffixes,
+				ControlURL: control, AuthKeyEnv: authEnv, MatchRoot: matchRoot,
 			}
 			if err := cfg.Normalize(); err != nil {
 				return err
 			}
-			path := cfgPath
+			path := cfg.Path()
 			if path == "" {
 				path = tsmux.DefaultPath()
 			}
@@ -344,17 +351,21 @@ func cmdProfile() *cobra.Command {
 				return err
 			}
 			p := cfg.Profiles[args[0]]
-			fmt.Printf("added %s (http 127.0.0.1:%d, socks5 127.0.0.1:%d) to %s\n", args[0], p.HTTPPort, p.SOCKSPort, path)
+			emit(p, func() {
+				fmt.Printf("added %s (http 127.0.0.1:%d, socks5 127.0.0.1:%d) to %s\n", args[0], p.HTTPPort, p.SOCKSPort, path)
+			})
 			return nil
 		},
 	}
-	add.Flags().StringSliceVar(&suffixes, "suffix", nil, "DNS suffix this tailnet owns, repeatable (e.g. .example.ts.net)")
+	add.Flags().StringVar(&displayName, "display-name", "", "human-readable name for the GUI")
+	add.Flags().StringSliceVar(&suffixes, "suffix", nil, "DNS suffix this tailnet owns, repeatable; omit it and tsmux learns it at first login")
 	add.Flags().StringVar(&control, "control-url", "", "custom control server (Headscale)")
 	add.Flags().StringVar(&authEnv, "auth-key-env", "", "env var holding an auth key")
 	add.Flags().BoolVar(&matchRoot, "match-root", false, "claim bare single-label hostnames")
 	c.AddCommand(add)
 
-	c.AddCommand(&cobra.Command{
+	var purge bool
+	rm := &cobra.Command{
 		Use: "rm <name>", Short: "Remove a profile from the config", Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			cfg, err := load()
@@ -364,6 +375,16 @@ func cmdProfile() *cobra.Command {
 			if _, ok := cfg.Profiles[args[0]]; !ok {
 				return fmt.Errorf("no profile %q", args[0])
 			}
+			// The daemon holds the state dir open; removing it underneath a
+			// live node leaves a node with nowhere to write.
+			if live, err := cfg.FetchStatus(); err == nil {
+				for _, s := range live {
+					if s.Profile == args[0] {
+						return fmt.Errorf("profile %q is running; stop the daemon first (tsmux up is holding it)", args[0])
+					}
+				}
+			}
+			dir := cfg.StateDir(args[0])
 			delete(cfg.Profiles, args[0])
 			if err := cfg.Normalize(); err != nil {
 				return err
@@ -371,10 +392,25 @@ func cmdProfile() *cobra.Command {
 			if err := cfg.Save(cfg.Path()); err != nil {
 				return err
 			}
-			fmt.Printf("removed %s (state dir %s left in place)\n", args[0], cfg.StateDir(args[0]))
+			if purge {
+				if err := os.RemoveAll(dir); err != nil {
+					return err
+				}
+			}
+			emit(map[string]any{"removed": args[0], "state_dir": dir, "purged": purge}, func() {
+				if purge {
+					fmt.Printf("removed %s (state dir %s deleted)\n", args[0], dir)
+					return
+				}
+				fmt.Printf("removed %s (state dir %s left in place)\n", args[0], dir)
+			})
 			return nil
 		},
-	})
+	}
+	rm.Flags().BoolVar(&purge, "purge", false, "also delete the profile's saved tailnet credentials")
+	c.AddCommand(rm)
+
+	c.AddCommand(cmdProfileSet())
 
 	c.AddCommand(&cobra.Command{
 		Use: "logout <name>", Short: "Forget a profile's tailnet credentials", Args: cobra.ExactArgs(1),
@@ -383,17 +419,71 @@ func cmdProfile() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if _, ok := cfg.Profiles[args[0]]; !ok {
+			p, ok := cfg.Profiles[args[0]]
+			if !ok {
 				return fmt.Errorf("no profile %q", args[0])
 			}
-			dir := cfg.StateDir(args[0])
-			if err := os.RemoveAll(dir); err != nil {
-				return err
+			st, err := cfg.PostLogout(args[0])
+			if err != nil {
+				// No daemon to ask: clearing the state dir is the same thing,
+				// minus the node that would have re-asked for a login URL.
+				dir := cfg.StateDir(args[0])
+				if rmErr := os.RemoveAll(dir); rmErr != nil {
+					return rmErr
+				}
+				st = tsmux.Status{
+					Profile: args[0], Display: p.DisplayName, State: "Stopped",
+					HTTPProxy: fmt.Sprintf("127.0.0.1:%d", p.HTTPPort),
+					SOCKS5:    fmt.Sprintf("127.0.0.1:%d", p.SOCKSPort),
+				}
 			}
-			fmt.Printf("cleared %s; next `tsmux up` will ask for login\n", dir)
+			emit(st, func() { fmt.Printf("logged %s out; it will ask for a new login\n", args[0]) })
 			return nil
 		},
 	})
+	return c
+}
+
+func cmdProfileSet() *cobra.Command {
+	var req tsmux.PrefsRequest
+	var acceptRoutes, acceptDNS, shieldsUp, exitNodeLAN bool
+	var exitNode string
+	c := &cobra.Command{
+		Use: "set <name>", Short: "Change one profile's Tailscale preferences", Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := load()
+			if err != nil {
+				return err
+			}
+			if _, ok := cfg.Profiles[args[0]]; !ok {
+				return fmt.Errorf("no profile %q", args[0])
+			}
+			req.Profile = args[0]
+			// Only flags the user actually passed are sent; the rest stay put.
+			for name, set := range map[string]func(){
+				"accept-routes": func() { req.AcceptRoutes = &acceptRoutes },
+				"accept-dns":    func() { req.AcceptDNS = &acceptDNS },
+				"shields-up":    func() { req.ShieldsUp = &shieldsUp },
+				"exit-node":     func() { req.ExitNode = &exitNode },
+				"exit-node-lan": func() { req.ExitNodeAllowLAN = &exitNodeLAN },
+			} {
+				if cmd.Flags().Changed(name) {
+					set()
+				}
+			}
+			st, err := cfg.PostPrefs(req)
+			if err != nil {
+				return err
+			}
+			emit(st, func() { fmt.Printf("%s: %s\n", st.Profile, st.State) })
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&acceptRoutes, "accept-routes", false, "accept subnet routes advertised by the tailnet")
+	c.Flags().BoolVar(&acceptDNS, "accept-dns", false, "use the tailnet's DNS settings")
+	c.Flags().BoolVar(&shieldsUp, "shields-up", false, "block incoming connections")
+	c.Flags().StringVar(&exitNode, "exit-node", "", "stable node ID of an exit node, or \"\" to clear")
+	c.Flags().BoolVar(&exitNodeLAN, "exit-node-lan", false, "allow local network access while using an exit node")
 	return c
 }
 
@@ -704,6 +794,14 @@ func cmdDoctor() *cobra.Command {
 			}
 			if len(cfg.Ordered()) == 0 {
 				problems = append(problems, "no profiles configured")
+			}
+			if live, err := cfg.FetchStatus(); err == nil {
+				for _, s := range live {
+					if s.SuffixConflict != "" {
+						problems = append(problems, fmt.Sprintf("%s learned suffix %s but %s already claims it; %s is reachable only on %s",
+							s.Profile, s.MagicDNSSuffix, s.SuffixConflict, s.Profile, s.HTTPProxy))
+					}
+				}
 			}
 			emit(map[string]any{"config": cfg.Path(), "problems": problems}, func() {
 				fmt.Printf("config: %s\nprofiles: %d\n", cfg.Path(), len(cfg.Ordered()))
