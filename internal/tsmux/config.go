@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -88,21 +89,68 @@ func Default() *Config {
 			ProfileSOCKSBase:    43111,
 			ProfileHostnameBase: "tsmux",
 		},
-		Paths:    Paths{StateDir: "~/.local/state/tsmux"},
+		Paths:    Paths{StateDir: stateDirDefault()},
 		Security: Security{RequireLoopbackListeners: true},
 		Profiles: map[string]*Profile{},
 	}
 }
 
-func DefaultPath() string {
+// configCandidates lists config locations in precedence order: an explicit
+// override, then XDG, then the platform default. macOS's UserConfigDir is
+// ~/Library/Application Support, which is the wrong home for a CLI's config,
+// so XDG wins here even on Darwin.
+func configCandidates() []string {
 	if v := os.Getenv("TSMUX_CONFIG"); v != "" {
-		return v
+		return []string{v}
 	}
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		dir = filepath.Join(os.Getenv("HOME"), ".config")
+	var out []string
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		out = append(out, filepath.Join(xdg, "tsmux", "config.yaml"))
 	}
-	return filepath.Join(dir, "tsmux", "config.yaml")
+	if home := os.Getenv("HOME"); home != "" {
+		out = append(out, filepath.Join(home, ".config", "tsmux", "config.yaml"))
+	}
+	if dir, err := os.UserConfigDir(); err == nil {
+		p := filepath.Join(dir, "tsmux", "config.yaml")
+		if !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// DefaultPath is where a new config is written. It skips ~/.config only when
+// that directory does not exist at all.
+func DefaultPath() string {
+	c := configCandidates()
+	if len(c) == 1 {
+		return c[0]
+	}
+	for _, p := range c {
+		// Reuse a config that is already there, wherever it lives.
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	// An explicitly set XDG_CONFIG_HOME is an instruction, not a hint: honour
+	// it even when the directory has not been created yet.
+	if os.Getenv("XDG_CONFIG_HOME") != "" {
+		return c[0]
+	}
+	for _, p := range c {
+		if _, err := os.Stat(filepath.Dir(filepath.Dir(p))); err == nil {
+			return p
+		}
+	}
+	return c[0]
+}
+
+// stateDirDefault follows XDG_STATE_HOME, falling back to ~/.local/state.
+func stateDirDefault() string {
+	if v := os.Getenv("XDG_STATE_HOME"); v != "" {
+		return filepath.Join(v, "tsmux")
+	}
+	return filepath.Join(os.Getenv("HOME"), ".local", "state", "tsmux")
 }
 
 func Load(path string) (*Config, error) {

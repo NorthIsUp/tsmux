@@ -21,6 +21,23 @@ import (
 type Node struct {
 	Profile *Profile
 	srv     *tsnet.Server
+
+	// The control server hands out the interactive login URL once and
+	// clears it from later status reads, so hold onto it until we are up.
+	authMu  sync.Mutex
+	authURL string
+}
+
+func (n *Node) setAuthURL(u string) {
+	n.authMu.Lock()
+	n.authURL = u
+	n.authMu.Unlock()
+}
+
+func (n *Node) AuthURL() string {
+	n.authMu.Lock()
+	defer n.authMu.Unlock()
+	return n.authURL
 }
 
 type Manager struct {
@@ -103,11 +120,16 @@ func (m *Manager) watchLogin(ctx context.Context, name string, srv *tsnet.Server
 	if err != nil {
 		return
 	}
+	n, err := m.Node(name)
+	if err != nil {
+		return
+	}
 	announced := ""
 	for ctx.Err() == nil {
 		st, err := lc.StatusWithoutPeers(ctx)
 		if err == nil {
 			if st.BackendState == "Running" {
+				n.setAuthURL("")
 				if announced != "" {
 					log.Printf("[%s] authenticated", name)
 				}
@@ -115,6 +137,7 @@ func (m *Manager) watchLogin(ctx context.Context, name string, srv *tsnet.Server
 			}
 			if st.AuthURL != "" && st.AuthURL != announced {
 				announced = st.AuthURL
+				n.setAuthURL(st.AuthURL)
 				log.Printf("[%s] needs login: %s", name, st.AuthURL)
 			}
 		}
@@ -206,6 +229,9 @@ func (m *Manager) Status(ctx context.Context) []Status {
 		if lc, err := n.srv.LocalClient(); err == nil {
 			if st, err := lc.Status(ctx); err == nil {
 				s.State, s.AuthURL, s.Peers = st.BackendState, st.AuthURL, len(st.Peer)
+				if s.AuthURL == "" {
+					s.AuthURL = n.AuthURL()
+				}
 				if st.Self != nil {
 					s.Self = st.Self.DNSName
 					for _, ip := range st.Self.TailscaleIPs {

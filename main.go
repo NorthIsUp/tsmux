@@ -167,8 +167,13 @@ func cmdUp() *cobra.Command {
 				return fmt.Errorf("pac server: %w", err)
 			}
 			closers = append(closers, func() { pl.Close() })
-			go (&http.Server{Handler: cfg.PACHandler()}).Serve(pl)
+			go (&http.Server{Handler: cfg.LocalHandler(func() any {
+				sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer scancel()
+				return m.Status(sctx)
+			})}).Serve(pl)
 			log.Printf("%-12s %s", "pac", cfg.PACURL())
+			log.Printf("%-12s %s", "status", cfg.StatusURL())
 
 			for _, t := range cfg.OrderedTunnels() {
 				dial := m.Dial
@@ -215,7 +220,8 @@ func cmdUp() *cobra.Command {
 // --- status / test ----------------------------------------------------------
 
 func cmdStatus() *cobra.Command {
-	return &cobra.Command{
+	var standalone bool
+	c := &cobra.Command{
 		Use:   "status",
 		Short: "Show every profile's tailnet status",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -223,14 +229,22 @@ func cmdStatus() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
-			defer cancel()
-			m := tsmux.NewManager(cfg, verbose)
-			if err := m.Start(ctx); err != nil {
-				return err
+			// Ask the running daemon first; starting our own nodes here would
+			// contend for the same state directories.
+			st, err := cfg.FetchStatus()
+			if err != nil {
+				if !standalone {
+					return err
+				}
+				ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
+				defer cancel()
+				m := tsmux.NewManager(cfg, verbose)
+				if err := m.Start(ctx); err != nil {
+					return err
+				}
+				defer m.Close()
+				st = m.Status(ctx)
 			}
-			defer m.Close()
-			st := m.Status(ctx)
 			emit(st, func() {
 				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 				fmt.Fprintln(w, "PROFILE\tSTATE\tADDRESS\tPEERS\tHTTP PROXY\tSUFFIXES")
@@ -247,6 +261,8 @@ func cmdStatus() *cobra.Command {
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&standalone, "standalone", false, "start nodes locally if no daemon is running")
+	return c
 }
 
 func cmdTest() *cobra.Command {

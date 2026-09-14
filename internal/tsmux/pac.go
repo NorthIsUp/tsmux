@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // PAC renders a proxy auto-config that sends each tailnet's names to that
@@ -55,12 +56,45 @@ func cidrToPAC(cidr string) (ip, mask string, ok bool) {
 
 func (c *Config) PACURL() string { return "http://" + c.Router.PACListen + "/proxy.pac" }
 
-func (c *Config) PACHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// StatusURL is the running daemon's JSON status. Clients (the menu bar app,
+// `tsmux status`) read it instead of starting their own tsnet nodes, which
+// would fight over the same state directory.
+func (c *Config) StatusURL() string { return "http://" + c.Router.PACListen + "/status" }
+
+// LocalHandler serves the PAC file and the daemon's status API on one
+// loopback listener.
+func (c *Config) LocalHandler(status func() any) http.Handler {
+	mux := http.NewServeMux()
+	pac := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
 		w.Header().Set("Cache-Control", "no-store")
 		fmt.Fprint(w, c.PAC())
+	}
+	mux.HandleFunc("/proxy.pac", pac)
+	mux.HandleFunc("/", pac)
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		enc.Encode(status())
 	})
+	return mux
+}
+
+// FetchStatus reads the running daemon's status, or reports that it is down.
+func (c *Config) FetchStatus() ([]Status, error) {
+	cl := &http.Client{Timeout: 3 * time.Second}
+	resp, err := cl.Get(c.StatusURL())
+	if err != nil {
+		return nil, fmt.Errorf("tsmux daemon is not running (start it with `tsmux up`)")
+	}
+	defer resp.Body.Close()
+	var out []Status
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // --- system proxy -----------------------------------------------------------
