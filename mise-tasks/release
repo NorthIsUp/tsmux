@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#MISE description="Tag v<VERSION> and push it, which is what publishes a release"
+set -euo pipefail
+
+version=$(tr -d '[:space:]' < VERSION)
+if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "VERSION is not a bare semver: '$version'" >&2
+  exit 1
+fi
+
+tag="v$version"
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  echo "$tag already exists — bump VERSION first (mise run bump-patch)" >&2
+  exit 1
+fi
+if [ -n "$(git status --porcelain -uall)" ]; then
+  echo "working tree is dirty; commit before tagging so the tag matches what ships" >&2
+  exit 1
+fi
+
+git tag -a "$tag" -m "$tag"
+git push origin "$tag"
+echo "pushed $tag — the release workflow builds and publishes it"
