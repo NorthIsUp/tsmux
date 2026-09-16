@@ -115,7 +115,10 @@ func (c *Config) LocalHandler(m *Manager) http.Handler {
 
 // PrefsRequest is the POST /prefs body: absent field means "leave alone".
 type PrefsRequest struct {
-	Profile          string  `json:"profile"`
+	Profile string `json:"profile"`
+	// Connected is this one tailnet's on/off switch. Disconnecting a tailnet
+	// leaves the others running, which is the point of running them together.
+	Connected        *bool   `json:"connected,omitempty"`
 	AcceptRoutes     *bool   `json:"accept_routes,omitempty"`
 	AcceptDNS        *bool   `json:"accept_dns,omitempty"`
 	ShieldsUp        *bool   `json:"shields_up,omitempty"`
@@ -125,6 +128,9 @@ type PrefsRequest struct {
 
 func (r PrefsRequest) masked() *ipn.MaskedPrefs {
 	mp := &ipn.MaskedPrefs{}
+	if r.Connected != nil {
+		mp.WantRunning, mp.WantRunningSet = *r.Connected, true
+	}
 	if r.AcceptRoutes != nil {
 		mp.RouteAll, mp.RouteAllSet = *r.AcceptRoutes, true
 	}

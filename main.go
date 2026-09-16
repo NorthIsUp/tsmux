@@ -473,7 +473,7 @@ func cmdProfile() *cobra.Command {
 
 func cmdProfileSet() *cobra.Command {
 	var req tsmux.PrefsRequest
-	var acceptRoutes, acceptDNS, shieldsUp, exitNodeLAN bool
+	var acceptRoutes, acceptDNS, shieldsUp, exitNodeLAN, connected bool
 	var exitNode, hostname string
 	var addSuffix, rmSuffix []string
 	c := &cobra.Command{
@@ -533,6 +533,7 @@ func cmdProfileSet() *cobra.Command {
 			req.Profile = args[0]
 			// Only flags the user actually passed are sent; the rest stay put.
 			for name, set := range map[string]func(){
+				"connected":     func() { req.Connected = &connected },
 				"accept-routes": func() { req.AcceptRoutes = &acceptRoutes },
 				"accept-dns":    func() { req.AcceptDNS = &acceptDNS },
 				"shields-up":    func() { req.ShieldsUp = &shieldsUp },
@@ -551,6 +552,7 @@ func cmdProfileSet() *cobra.Command {
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&connected, "connected", true, "connect or disconnect this tailnet, leaving the others alone")
 	c.Flags().BoolVar(&acceptRoutes, "accept-routes", false, "accept subnet routes advertised by the tailnet")
 	c.Flags().BoolVar(&acceptDNS, "accept-dns", false, "use the tailnet's DNS settings")
 	c.Flags().BoolVar(&shieldsUp, "shields-up", false, "block incoming connections")

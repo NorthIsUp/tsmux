@@ -38,6 +38,11 @@ type Node struct {
 	authURL  string
 	suffix   string // learned MagicDNS suffix, no leading dot
 	conflict string // profile already claiming that suffix, if any
+
+	// Uptime is per tailnet, not per daemon: tailnets drop and reconnect
+	// independently, and one that just came back is worth noticing.
+	upMu sync.Mutex
+	upAt time.Time
 }
 
 func (n *Node) setAuthURL(u string) {
@@ -50,6 +55,27 @@ func (n *Node) AuthURL() string {
 	n.authMu.Lock()
 	defer n.authMu.Unlock()
 	return n.authURL
+}
+
+// markUp records the start of a Running streak and leaves it alone while the
+// streak continues, so the figure keeps counting up rather than resetting on
+// every poll.
+func (n *Node) markUp(up bool) {
+	n.upMu.Lock()
+	defer n.upMu.Unlock()
+	if !up {
+		n.upAt = time.Time{}
+		return
+	}
+	if n.upAt.IsZero() {
+		n.upAt = time.Now()
+	}
+}
+
+func (n *Node) UpSince() time.Time {
+	n.upMu.Lock()
+	defer n.upMu.Unlock()
+	return n.upAt
 }
 
 func (n *Node) setSuffix(s, conflict string) {
@@ -181,45 +207,41 @@ func (m *Manager) watch(ctx context.Context, name string, srv *tsnet.Server) {
 	for ctx.Err() == nil {
 		tick := time.Second
 		if st, err := lc.StatusWithoutPeers(ctx); err == nil {
+			var request bool
+			request, emptyRuns = shouldRequestLogin(st.BackendState, st.AuthURL, n.AuthURL(), emptyRuns)
+			if request {
+				log.Printf("[%s] no login URL after %d polls; requesting one", name, loginRequestPolls)
+				_ = lc.StartLoginInteractive(ctx)
+			}
 			switch st.BackendState {
 			case "Running":
+				n.markUp(true)
 				if announced != "" {
 					log.Printf("[%s] authenticated", name)
 					announced = ""
 				}
 				n.setAuthURL("")
-				emptyRuns = 0
 				if want := magicSuffix(st); want != "" && want != learned {
 					learned = want
 					m.learnSuffix(n, want)
 				}
 				tick = 5 * time.Second
 			case "NoState":
+				n.markUp(false)
 				// Still loading. The backend re-registers with the stored node
 				// key here, and asking for an interactive login during this
 				// window throws that key away for a brand new one — which
 				// control can only authorize through a browser. Wait.
 				learned = ""
 			case "NeedsLogin":
+				n.markUp(false)
 				learned = ""
-				switch {
-				case st.AuthURL != "":
-					emptyRuns = 0
+				if st.AuthURL != "" {
 					if st.AuthURL != announced {
 						announced = st.AuthURL
 						log.Printf("[%s] needs login: %s", name, st.AuthURL)
 					}
 					n.setAuthURL(st.AuthURL)
-				default:
-					// A login URL arrives on its own; StartLoginInteractive is
-					// a last resort because it regenerates the node key. Only
-					// ask after the backend has sat in NeedsLogin with no URL
-					// long enough that nothing is in flight.
-					if emptyRuns++; emptyRuns >= 10 && n.AuthURL() == "" {
-						emptyRuns = 0
-						log.Printf("[%s] no login URL after %ds; requesting one", name, emptyRuns)
-						_ = lc.StartLoginInteractive(ctx)
-					}
 				}
 			}
 		}
@@ -228,6 +250,38 @@ func (m *Manager) watch(ctx context.Context, name string, srv *tsnet.Server) {
 			return
 		case <-time.After(tick):
 		}
+	}
+}
+
+// loginRequestPolls is how many consecutive NeedsLogin polls with no auth URL
+// in sight must pass before watch asks for one.
+const loginRequestPolls = 10
+
+// shouldRequestLogin decides whether the watch loop should call
+// StartLoginInteractive, and returns the updated empty-poll counter.
+//
+// StartLoginInteractive regenerates the node key, which control can only
+// authorize through a browser, so it is a last resort. In particular "NoState"
+// means the backend is still loading and re-registering with the stored key:
+// asking there threw that key away and forced a browser login on every single
+// restart. Only "NeedsLogin" counts, and only once the backend has sat there
+// with no URL from either the status or the node long enough that nothing is
+// still in flight.
+func shouldRequestLogin(backendState, statusAuthURL, heldAuthURL string, emptyRuns int) (request bool, next int) {
+	switch backendState {
+	case "Running":
+		return false, 0
+	case "NeedsLogin":
+		if statusAuthURL != "" {
+			return false, 0
+		}
+		next = emptyRuns + 1
+		if next >= loginRequestPolls && heldAuthURL == "" {
+			return true, 0
+		}
+		return false, next
+	default:
+		return false, emptyRuns
 	}
 }
 
@@ -332,7 +386,21 @@ func (m *Manager) Dial(ctx context.Context, network, hostport string) (net.Conn,
 // commits to a single address and a peer advertising an unreachable IPv6
 // address would otherwise fail outright while its IPv4 address works.
 func (n *Node) Dial(ctx context.Context, network, hostport string) (net.Conn, error) {
-	conn, err := n.srv.Dial(ctx, network, hostport)
+	return dialV4Fallback(ctx, hostport,
+		func(ctx context.Context, addr string) (net.Conn, error) { return n.srv.Dial(ctx, network, addr) },
+		func(ctx context.Context, host string) ([]netip.Addr, error) { return n.queryTailnetDNS(ctx, host, "A") })
+}
+
+// dialV4Fallback is Node.Dial's logic without a tailnet attached to it. The
+// first error is the one reported: the fallback only ever adds attempts, so a
+// failure should read as "the tailnet dial failed", not as a DNS complaint.
+func dialV4Fallback(
+	ctx context.Context,
+	hostport string,
+	dial func(context.Context, string) (net.Conn, error),
+	lookupA func(context.Context, string) ([]netip.Addr, error),
+) (net.Conn, error) {
+	conn, err := dial(ctx, hostport)
 	if err == nil {
 		return conn, nil
 	}
@@ -343,12 +411,12 @@ func (n *Node) Dial(ctx context.Context, network, hostport string) (net.Conn, er
 	if _, isIP := netip.ParseAddr(host); isIP == nil {
 		return nil, err
 	}
-	v4, qErr := n.queryTailnetDNS(ctx, host, "A")
+	v4, qErr := lookupA(ctx, host)
 	if qErr != nil || len(v4) == 0 {
 		return nil, err
 	}
 	for _, ip := range v4 {
-		c, dErr := n.srv.Dial(ctx, network, net.JoinHostPort(ip.String(), port))
+		c, dErr := dial(ctx, net.JoinHostPort(ip.String(), port))
 		if dErr == nil {
 			return c, nil
 		}
@@ -429,6 +497,7 @@ type Status struct {
 	User           *StatusUser      `json:"user,omitempty"`
 	KeyExpiry      *time.Time       `json:"key_expiry,omitempty"`
 	Health         []string         `json:"health,omitempty"`
+	ConnectedSince *time.Time       `json:"connected_since,omitempty"`
 	AdminURL       string           `json:"admin_url,omitempty"`
 	Prefs          *StatusPrefs     `json:"prefs,omitempty"`
 	ExitNodes      []ExitNodeOption `json:"exit_node_options,omitempty"`
@@ -455,6 +524,7 @@ type StatusUser struct {
 }
 
 type StatusPrefs struct {
+	Connected        bool   `json:"connected"`
 	AcceptRoutes     bool   `json:"accept_routes"`
 	AcceptDNS        bool   `json:"accept_dns"`
 	ShieldsUp        bool   `json:"shields_up"`
@@ -523,6 +593,10 @@ func (m *Manager) statusOf(ctx context.Context, n *Node) Status {
 	if s.AuthURL == "" {
 		s.AuthURL = n.AuthURL()
 	}
+	if up := n.UpSince(); !up.IsZero() {
+		t := up
+		s.ConnectedSince = &t
+	}
 	if st.CurrentTailnet != nil {
 		s.Tailnet = st.CurrentTailnet.Name
 	}
@@ -574,6 +648,7 @@ func (m *Manager) statusOf(ctx context.Context, n *Node) Status {
 	sort.Slice(s.Devices, func(i, j int) bool { return s.Devices[i].Name < s.Devices[j].Name })
 	if pr, err := lc.GetPrefs(ctx); err == nil {
 		s.Prefs = &StatusPrefs{
+			Connected:        pr.WantRunning,
 			AcceptRoutes:     pr.RouteAll,
 			AcceptDNS:        pr.CorpDNS,
 			ShieldsUp:        pr.ShieldsUp,

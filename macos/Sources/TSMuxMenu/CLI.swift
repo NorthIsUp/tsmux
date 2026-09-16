@@ -49,6 +49,8 @@ struct Device: Decodable, Sendable, Identifiable, Hashable {
 }
 
 struct ProfilePrefs: Decodable, Sendable, Hashable {
+  /// This tailnet's own on/off state, independent of the others.
+  let connected: Bool
   let acceptRoutes: Bool
   let acceptDNS: Bool
   let shieldsUp: Bool
@@ -56,6 +58,7 @@ struct ProfilePrefs: Decodable, Sendable, Hashable {
   let exitNodeAllowLAN: Bool
 
   enum CodingKeys: String, CodingKey {
+    case connected
     case acceptRoutes = "accept_routes"
     case acceptDNS = "accept_dns"
     case shieldsUp = "shields_up"
@@ -95,6 +98,7 @@ struct ProfileStatus: Decodable, Sendable, Identifiable {
   let suffixConflict: String?
   let user: UserProfile?
   let keyExpiry: String?
+  let connectedSince: String?
   let healthMessages: [String]?
   let adminURL: String?
   let prefs: ProfilePrefs?
@@ -119,6 +123,7 @@ struct ProfileStatus: Decodable, Sendable, Identifiable {
     case suffixConflict = "suffix_conflict"
     case user
     case keyExpiry = "key_expiry"
+    case connectedSince = "connected_since"
     case healthMessages = "health"
     case adminURL = "admin_url"
     case prefs
@@ -149,6 +154,29 @@ struct ProfileStatus: Decodable, Sendable, Identifiable {
 
   var name: String { displayName.isEmpty ? profile : displayName }
 
+  /// How long this tailnet has been connected, compactly. Nil when it isn't —
+  /// a tailnet that is down has no uptime, and "0s" would imply otherwise.
+  var uptime: String? {
+    guard let raw = connectedSince, !raw.isEmpty else { return nil }
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let since = iso.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+    guard let since else { return nil }
+    let secs = max(0, Int(Date().timeIntervalSince(since)))
+    switch secs {
+    case ..<60: return "\(secs)s"
+    case ..<3600: return "\(secs / 60)m"
+    case ..<86400:
+      let h = secs / 3600
+      let m = (secs % 3600) / 60
+      return m == 0 ? "\(h)h" : "\(h)h \(m)m"
+    default:
+      let d = secs / 86400
+      let h = (secs % 86400) / 3600
+      return h == 0 ? "\(d)d" : "\(d)d \(h)h"
+    }
+  }
+
   /// A configured-but-not-yet-reported tailnet. The config is the truth about
   /// which tailnets exist; the daemon is only the truth about how they are
   /// doing. Without this the UI claims you have none while it is starting.
@@ -159,7 +187,7 @@ struct ProfileStatus: Decodable, Sendable, Identifiable {
       suffixes: p.suffixes, httpProxy: "127.0.0.1:\(p.httpProxyPort)",
       socks5Proxy: "127.0.0.1:\(p.socks5ProxyPort)", error: nil,
       tailnet: nil, magicDNSSuffix: nil, suffixConflict: nil, user: nil,
-      keyExpiry: nil, healthMessages: nil, adminURL: nil, prefs: nil,
+      keyExpiry: nil, connectedSince: nil, healthMessages: nil, adminURL: nil, prefs: nil,
       exitNodeOptions: nil, devices: nil)
   }
 

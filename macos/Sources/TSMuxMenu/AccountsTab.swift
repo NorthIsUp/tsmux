@@ -206,6 +206,9 @@ struct AccountDetail: View {
         }
       }
       MachineNameRow(model: model, profile: profile)
+      if let up = profile.uptime {
+        LabeledContent("Connected") { Text(up).foregroundStyle(.secondary) }
+      }
       if let ips = profile.ips, !ips.isEmpty {
         LabeledContent("Addresses") {
           VStack(alignment: .trailing, spacing: 2) {
