@@ -1,72 +1,124 @@
 # tsmux
 
-Run **any number of Tailscale tailnets at once** and route traffic to the right
+**Run every one of your Tailscale tailnets at once.** Work, a client's, your
+homelab — all connected simultaneously, with hostnames resolving to the right
 one automatically.
 
-Tailscale's own client holds one tailnet at a time — switching profiles tears
-down the other. tsmux instead runs one userspace node per tailnet
+Tailscale's own client holds one tailnet at a time; switching accounts tears
+the other down. tsmux runs one userspace node per tailnet
 ([`tsnet`](https://pkg.go.dev/tailscale.com/tsnet)) inside a single process, so
-your work tailnet, a client's tailnet, and your homelab are all reachable
-simultaneously. No TUN device, no root, no profile switching.
+nothing has to be switched off to reach something else. No TUN device, no root,
+no admin prompt.
 
-MIT licensed. A free-software alternative to TailMux.
-
-## How it works
-
-```
-                  ┌── suffix .work.ts.net  ──► tsnet node "work"  ──► work tailnet
-browser / curl ──►│── suffix .acme.ts.net  ──► tsnet node "acme"  ──► client tailnet
-  (PAC or proxy)  └── suffix .home.ts.net  ──► tsnet node "home"  ──► homelab tailnet
-```
-
-`tsmux up` starts every node plus loopback listeners:
-
-| listener | what it is |
-|---|---|
-| `127.0.0.1:43100` / `:43101` | router HTTP + SOCKS5 proxy — picks the tailnet from the hostname |
-| `127.0.0.1:43110`, `43112`, … | one HTTP proxy per profile, for pinning a browser profile to one tailnet |
-| `127.0.0.1:43180/proxy.pac` | generated PAC file so browsers route every tailnet correctly |
-
-Hostnames are never resolved on the host OS. They are passed to the owning
-tailnet and resolved by its MagicDNS, so identical names in different tailnets
-stay separate.
+MIT licensed.
 
 ## Install
+
+Download `TSMux-<version>-macos.zip` from
+[Releases](https://github.com/NorthIsUp/tsmux/releases), unzip, and drag
+**TSMux.app** to `/Applications`.
+
+The app is ad-hoc signed, not notarized, so macOS will refuse it on first
+launch. Right-click → **Open**, or:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/TSMux.app
+```
+
+## Getting started
+
+1. Launch TSMux. It lives in the menu bar — the dot grid with an arrow.
+2. Click it → **Set up your first tailnet…**
+3. Give it a name. That's the only thing you type.
+4. Sign in when the browser opens.
+
+That's it. tsmux learns the tailnet's DNS suffix itself, so you never look up
+or type `tailnet-abc123.ts.net`. Add another tailnet the same way and both stay
+connected.
+
+## What you get
+
+**Names just work.** `https://grafana.your-tailnet.ts.net` resolves in your
+browser with nothing configured — tsmux publishes a proxy auto-config file and
+points the system at it while a tailnet is up. Traffic to anything else goes
+out normally, untouched.
+
+**Every tailnet at once.** Overlapping names are not a problem: each tailnet
+owns its own DNS suffix, and tsmux routes by longest match. Two tailnets can
+both have a `grafana`.
+
+**A device list per tailnet.** Open a tailnet's submenu → **Devices**, grouped
+by owner and by tag. Click to copy the URL; hold <kbd>⌥</kbd> for the IP,
+<kbd>⌥⇧</kbd> for the short name — the value you'll get is shown greyed on the
+right.
+
+**Per-tailnet settings.** Accept subnet routes, use the tailnet's DNS, allow
+incoming connections, pick an exit node — each set independently per tailnet,
+in **Settings → Accounts**.
+
+**Nothing hidden.** Features a userspace node genuinely cannot do —
+running *as* an exit node, VPN On Demand, Tailnet Lock — still appear in
+Settings, disabled, with a note saying why. They need a system VPN device,
+which is the same thing tsmux declines to use in order to run unlimited
+tailnets at once.
+
+## For the terminal
+
+Browsers pick up the PAC file automatically; command line tools don't read it,
+so point them at tsmux explicitly:
+
+```sh
+tsmux run curl https://grafana.your-tailnet.ts.net/   # one command
+eval "$(tsmux env)"                                    # this whole shell
+tsmux ssh admin@box.your-tailnet.ts.net                # ssh through the right tailnet
+```
+
+The CLI ships inside the app bundle at
+`/Applications/TSMux.app/Contents/Resources/tsmux`. Symlink it onto your
+`PATH`, or install it on its own:
 
 ```sh
 go install github.com/NorthIsUp/tsmux@latest
 ```
 
-## Quick start
+| command | purpose |
+|---|---|
+| `up` / `down` | run the daemon in the foreground / stop a running one |
+| `status` | per-tailnet state, address, peer count |
+| `test <host>` | which tailnet owns a hostname, and why |
+| `run` / `env` | proxy environment for one command or a whole shell |
+| `ssh` / `connect` / `tunnel` | SSH, raw TCP, forwarded local ports |
+| `profile add/list/rm/set` | manage tailnets without the GUI |
+| `pac print/url/apply/restore` | the browser proxy config |
+| `doctor` | config, port and overlap checks |
 
-```sh
-tsmux init                                          # write ~/.config/tsmux/config.yaml
-tsmux profile add work --suffix .your-tailnet.ts.net --match-root
-tsmux profile add acme --suffix .acme-corp.ts.net
-tsmux up                                            # prints a login URL per tailnet
+Every command takes `--json`.
+
+## How it works
+
+```
+                  ┌── .work.ts.net  ──► tsnet node "work"  ──► work tailnet
+browser ─ PAC ───►│── .acme.ts.net  ──► tsnet node "acme"  ──► client tailnet
+                  └── .home.ts.net  ──► tsnet node "home"  ──► homelab tailnet
 ```
 
-Then, in another shell:
+Each tailnet gets its own node, its own state directory, and its own pair of
+loopback proxies. A hostname is never resolved on the host: it goes to the
+tailnet that owns it and is resolved by that tailnet's DNS, which is why
+overlapping names stay separate and why split-DNS domains work without a
+system Tailscale installed.
 
-```sh
-tsmux status                        # per-tailnet state, addresses, peers
-tsmux test nas.acme-corp.ts.net     # which profile owns a name, and why
-tsmux run curl https://nas.acme-corp.ts.net/
-eval "$(tsmux env)"                 # point this shell at the router
-tsmux ssh admin@box.your-tailnet.ts.net
-```
-
-For browsers, either run `tsmux up --system-proxy` (macOS; restores your
-previous settings on exit) or paste the PAC URL from `tsmux pac url` into your
-browser's proxy settings. Per-profile ports let you pin one browser profile to
-one tailnet: point it at `127.0.0.1:43110` and it only ever sees that tailnet.
+| listener | what it is |
+|---|---|
+| `127.0.0.1:43100` / `:43101` | router HTTP + SOCKS5 — picks the tailnet from the hostname |
+| `127.0.0.1:43110`, `43112`, … | one proxy per tailnet, for pinning a browser profile to one |
+| `127.0.0.1:43180/proxy.pac` | the generated PAC file |
+| `127.0.0.1:43180/status` | daemon status as JSON |
 
 ## Configuration
 
-`~/.config/tsmux/config.yaml`. tsmux owns this file and rewrites it (when you
-add a profile, or when it learns a tailnet's DNS suffix at first login), so
-comments are not preserved. `suffixes` is optional: leave it out and tsmux
-fills it in once the profile logs in.
+The GUI writes `~/.config/tsmux/config.yaml` (or `$XDG_CONFIG_HOME`). You only
+need to touch it for things the GUI does not expose:
 
 ```yaml
 version: 1
@@ -74,13 +126,9 @@ version: 1
 profiles:
   work:
     display_name: "Work"
-    suffixes: [".your-tailnet.ts.net"]
-    match_root: true            # also claim bare names like `laptop`
-    auth_key_env: TSMUX_WORK_AUTHKEY   # optional; otherwise log in via URL
-  acme:
-    suffixes: [".acme-corp.ts.net"]
-    ip_routes: ["100.64.0.0/10"]       # route these CIDRs here too
-    accept_routes: true                # use this tailnet's subnet routers
+    suffixes: [".your-tailnet.ts.net"]   # learned automatically after first login
+    match_root: true                     # also claim bare names like `laptop`
+    auth_key_env: TSMUX_WORK_AUTHKEY     # optional; skips the browser
   hs:
     suffixes: [".hs.internal"]
     control_url: "https://headscale.example.com"   # Headscale works too
@@ -88,66 +136,46 @@ profiles:
 tunnels:                        # for clients that can't speak a proxy
   pg:
     listen: "127.0.0.1:15432"
-    profile: acme
-    target: "db.acme-corp.ts.net:5432"
+    profile: work
+    target: "db.your-tailnet.ts.net:5432"
 
 security:
-  require_loopback_listeners: true    # refuse to bind anything non-loopback
-  allow_cross_profile_fallback: false # unmatched hosts error instead of leaking
-  allow_ip_literals: false            # bare IPs must be covered by ip_routes
+  require_loopback_listeners: true     # refuse to bind anything non-loopback
+  allow_cross_profile_fallback: false  # unmatched hosts error instead of leaking
+  allow_ip_literals: false             # bare IPs must be covered by ip_routes
 ```
 
-Routing rules, in order: longest matching `suffixes` entry wins; then
-`ip_routes` for literal addresses; then `match_root` for bare single-label
-names. Anything unmatched is refused rather than sent to an arbitrary tailnet.
-`tsmux doctor` reports overlapping claims and port conflicts.
+Routing order: longest matching suffix, then `ip_routes` for literal addresses,
+then `match_root` for bare names. Anything unmatched is refused rather than
+sent to an arbitrary tailnet. `tsmux doctor` reports overlaps and port
+conflicts. tsmux owns this file and rewrites it; comments are not preserved.
 
-Ports are derived from each profile's sorted position, so they stay stable when
-you edit unrelated parts of the config. Override with `http_proxy_port` /
-`socks5_proxy_port` on a profile.
+## Limitations
 
-## Commands
-
-| command | purpose |
-|---|---|
-| `up` | start every tailnet, the router, PAC server and tunnels |
-| `status` | per-profile backend state, tailnet address, peer count |
-| `test <host>` | show which profile owns a hostname, and why |
-| `profile add/list/rm/logout` | manage profiles |
-| `pac print/url/apply/restore/status` | browser proxy auto-config |
-| `env` / `run` | proxy environment for a shell or one command |
-| `connect` / `tunnel` / `ssh` | raw TCP, forwarded ports, SSH |
-| `dns query` | resolve a name inside its owning tailnet |
-| `doctor` | config, port and overlap checks |
-
-Every command takes `--json`.
-
-## Status
-
-Working: multi-tailnet routing, HTTP + SOCKS5 proxies, PAC generation and
-macOS system-proxy apply/restore, tunnels, SSH, profile-scoped DNS, doctor.
-
-Not built: a menu-bar GUI, Linux/Windows system-proxy integration (use the PAC
-URL directly), and a background service wrapper.
+- macOS only for the app. The CLI builds and runs on Linux; the system-proxy
+  integration is macOS-specific, so elsewhere point your browser at the PAC URL.
+- Cannot run *as* an exit node, and has no VPN On Demand or Tailnet Lock —
+  all three need a system VPN device.
+- Adding or removing a tailnet restarts the daemon, a 2–5 second blip.
 
 ## Releasing
 
-`VERSION` at the repo root is the single source of truth. Both
-`scripts/build-app.sh` (via `-ldflags -X main.version=…`) and
-`.github/workflows/release.yml` read it; nothing else stores the version.
+`VERSION` holds the version; `scripts/build-app.sh` reads it for `-ldflags`.
+Bump it with `mise run bump-patch|bump-minor|bump-major`, commit, then:
 
 ```sh
-mise run bump-patch   # or bump-minor / bump-major
+mise run release      # tags v<VERSION> and pushes it
 ```
 
-Land the bump on `main` and the release workflow tags `v<version>`, builds
-`tsmux` for darwin/linux × arm64/amd64 plus a zipped `TSMux.app`, and publishes
-a GitHub release with SHA256 checksums. If `VERSION` is unchanged the workflow
-is a no-op, so ordinary commits to `main` do not release.
+Pushing that tag is what builds and publishes the release — cross-compiled
+binaries, a zipped app, and SHA256 checksums. An ordinary commit to main
+publishes nothing.
 
-`TSMux.app` in the release is ad-hoc signed and **not notarized** — clear the
-quarantine flag after installing:
+## Development
 
 ```sh
-xattr -dr com.apple.quarantine /Applications/TSMux.app
+mise run dev       # rebuild + relaunch the app on every source change
+mise run test      # go test -race
+mise run lint      # gofmt + vet
+mise run hk:check  # everything CI runs
 ```
