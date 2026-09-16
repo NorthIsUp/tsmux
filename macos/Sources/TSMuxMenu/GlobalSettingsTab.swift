@@ -181,9 +181,12 @@ struct AboutTab: View {
 
   var body: some View {
     VStack(spacing: 12) {
-      Image(systemName: "point.3.filled.connected.trianglepath.dotted")
-        .font(.system(size: 48))
-        .foregroundStyle(Color.accentColor)
+      // The real app icon, not an approximation of it: NSApp already holds
+      // the one the bundle shipped with, so About cannot drift from Finder.
+      Image(nsImage: NSApp.applicationIconImage)
+        .resizable()
+        .frame(width: 96, height: 96)
+        .accessibilityLabel("TSMux")
       Text("TSMux").font(.title).bold()
       Text("Version \(version)").foregroundStyle(.secondary)
       Text("Runs every one of your Tailscale tailnets at the same time, in userspace.")
