@@ -44,18 +44,37 @@ func TestDefaultPathPrecedence(t *testing.T) {
 	}
 
 	// An existing config is reused wherever it already lives, so upgrading
-	// does not orphan a config written under the old macOS default.
+	// does not orphan a config written under the platform default — which is
+	// ~/Library/Application Support on macOS and ~/.config elsewhere, hence
+	// asking the platform rather than hardcoding a path.
 	clean()
-	legacy := filepath.Join(home, "Library/Application Support/tsmux/config.yaml")
-	if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(legacy, []byte("version: 1\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	set("", ".config")
-	if got := DefaultPath(); got != legacy {
-		t.Errorf("existing config: got %s, want %s", got, legacy)
+	platformDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(platformDir, "tsmux", "config.yaml")
+	if legacy == filepath.Join(home, ".config/tsmux/config.yaml") {
+		// Same place XDG already points: nothing distinct to prove here.
+		legacy = filepath.Join(home, "Library/Application Support/tsmux/config.yaml")
+		t.Setenv("TSMUX_CONFIG", legacy)
+		if got := DefaultPath(); got != legacy {
+			t.Errorf("explicit override: got %s, want %s", got, legacy)
+		}
+		t.Setenv("TSMUX_CONFIG", "")
+		legacy = ""
+	}
+	if legacy != "" {
+		if err := os.MkdirAll(filepath.Dir(legacy), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(legacy, []byte("version: 1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		set("", ".config")
+		if got := DefaultPath(); got != legacy {
+			t.Errorf("existing config: got %s, want %s", got, legacy)
+		}
 	}
 
 	clean()
