@@ -31,17 +31,21 @@ func drawIcon(size: CGFloat) -> NSImage {
     }
     ctx.restoreGState()
 
-    // A multiplexer: several tailnets on the left and right, each running on
-    // its own line, all converging on one hub. That is literally what tsmux
-    // does, so the mark says it rather than decorating it.
-    let u = s / 16.0
-    let hub = CGPoint(x: 8 * u, y: 8 * u)
-    let colL = 3.05 * u
-    let colR = 12.95 * u
-    let rows: [CGFloat] = [4.05, 8.0, 11.95].map { $0 * u }
-    let node = 1.28 * u
-    let hubR = 1.72 * u
-    let line = 0.92 * u
+    // The menu bar mark, scaled up. The two are the same drawing so the icon
+    // in the Dock and the glyph in the menu bar cannot look like cousins:
+    // geometry is expressed in the menu bar's own 18x14 point grid and mapped
+    // into this square canvas.
+    let k = (13.2 * s / 16.0) / 18.0
+    let mid = CGPoint(x: s / 2, y: s / 2)
+    func at(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+      CGPoint(x: mid.x + (x - 9) * k, y: mid.y + (y - 7) * k)
+    }
+    let hub = at(9, 7)
+    let cols: [CGFloat] = [2.4, 15.6]
+    let rows: [CGFloat] = [2.4, 7, 11.6]
+    let node = 1.5 * k
+    let hubR = 2.0 * k
+    let line = 1.35 * k
 
     ctx.setStrokeColor(NSColor.white.cgColor)
     ctx.setFillColor(NSColor.white.cgColor)
@@ -49,48 +53,38 @@ func drawIcon(size: CGFloat) -> NSImage {
     ctx.setLineCap(.round)
     ctx.setLineJoin(.round)
 
-    for x in [colL, colR] {
-      let dir: CGFloat = x < hub.x ? 1 : -1
-      for y in rows {
+    for cx in cols {
+      for ry in rows {
+        let from = at(cx, ry)
         ctx.beginPath()
-        ctx.move(to: CGPoint(x: x, y: y))
-        if abs(y - hub.y) < 0.01 {
-          ctx.addLine(to: CGPoint(x: hub.x, y: y))
+        ctx.move(to: from)
+        if abs(ry - 7) < 0.01 {
+          ctx.addLine(to: hub)
         } else {
-          // Leave the node flat, then bend once into the hub — the straight
-          // run is what makes the lines read as separate channels.
-          // Run flat, then dive: approaching the hub diagonally rather than
-          // horizontally keeps the centre column clear for the spare channels.
-          let turn = CGPoint(x: x + dir * 1.75 * u, y: y)
-          ctx.addLine(to: turn)
+          let reach = (hub.x - from.x) * 0.62
           ctx.addCurve(
             to: hub,
-            control1: CGPoint(x: turn.x + dir * 1.15 * u, y: y),
-            control2: CGPoint(x: hub.x - dir * 1.5 * u, y: y - (y - hub.y) * 0.62))
+            control1: CGPoint(x: from.x + reach, y: from.y),
+            control2: CGPoint(x: hub.x - reach, y: hub.y))
         }
         ctx.strokePath()
+        ctx.fillEllipse(
+          in: CGRect(x: from.x - node, y: from.y - node, width: node * 2, height: node * 2))
       }
     }
 
-    for x in [colL, colR] {
-      for y in rows {
-        ctx.fillEllipse(in: CGRect(x: x - node, y: y - node, width: node * 2, height: node * 2))
-      }
-    }
-    // Two more channels straight up and down, greyed: capacity the hub has
-    // but nothing is plugged into yet. They keep the mark from reading as a
-    // fixed six-way splitter.
-    let spare: [CGFloat] = [rows[2], rows[0]]
+    // Two spare channels straight up and down, greyed: capacity the hub has
+    // that nothing is plugged into.
     let grey = NSColor(white: 1, alpha: 0.62)
     ctx.setStrokeColor(grey.cgColor)
     ctx.setFillColor(grey.cgColor)
-    for y in spare {
+    for ry in [rows[0], rows[2]] {
+      let p = at(9, ry)
       ctx.beginPath()
-      ctx.move(to: CGPoint(x: hub.x, y: y))
+      ctx.move(to: p)
       ctx.addLine(to: hub)
       ctx.strokePath()
-      ctx.fillEllipse(
-        in: CGRect(x: hub.x - node, y: y - node, width: node * 2, height: node * 2))
+      ctx.fillEllipse(in: CGRect(x: p.x - node, y: p.y - node, width: node * 2, height: node * 2))
     }
 
     ctx.setFillColor(NSColor.white.cgColor)
