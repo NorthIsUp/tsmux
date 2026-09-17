@@ -58,6 +58,10 @@ final class ToggleRowView: NSView {
     // titles of ordinary NSMenuItems rather than shifting per glyph width.
     icon.translatesAutoresizingMaskIntoConstraints = false
     icon.widthAnchor.constraint(equalToConstant: 16).isActive = true
+    // Height too, or a status glyph swapped in while the menu is tracking
+    // resizes the row — `pause.circle` is not `checkmark.circle.fill` — and
+    // the re-layout takes any open submenu down with it.
+    icon.heightAnchor.constraint(equalToConstant: 16).isActive = true
     // Left-aligned, so a narrow glyph (a status dot) starts at the same x as
     // a wide one (a globe) instead of being centred a couple of points in.
     icon.imageAlignment = .alignLeft
@@ -66,7 +70,7 @@ final class ToggleRowView: NSView {
     toggle.isEnabled = enabled
     toggle.target = self
     toggle.action = #selector(flipped)
-    toggle.controlSize = .mini
+    toggle.controlSize = .regular
 
     let row = NSStackView(views: [icon, label])
     row.orientation = .horizontal
@@ -126,6 +130,11 @@ final class ToggleRowView: NSView {
   /// Re-renders in place. The menu stays open across a toggle, so a row that
   /// only rendered at open time would keep showing the state the tailnet was
   /// in before you touched it.
+  ///
+  /// State only, never geometry: this runs while the menu is tracking, and
+  /// resizing a row then makes AppKit re-lay out the menu and drop whatever
+  /// submenu was open under the pointer. Anything that would change the row's
+  /// size is left for the next `menuWillOpen`, which builds every row afresh.
   func apply(isOn: Bool, enabled: Bool, leading: NSImage?, detail: String?) {
     // Through the animator, so a switch moved by something else — "All
     // tailnets" driving the individual ones — slides like one the user
@@ -135,10 +144,20 @@ final class ToggleRowView: NSView {
       toggle.animator().state = isOn ? .on : .off
     }
     toggle.isEnabled = enabled
+    // Safe: the image well is pinned to 16x16 whatever glyph lands in it. Its
+    // `isHidden` is not, because a hidden arranged subview leaves the stack
+    // entirely, so that stays as the row was built.
     icon.image = leading
-    icon.isHidden = leading == nil
-    detailLabel.stringValue = detail ?? ""
-    detailLabel.isHidden = detail == nil
+    let text = detail ?? ""
+    if abs(detailWidth(text) - detailWidth(detailLabel.stringValue)) < 1 {
+      detailLabel.stringValue = text
+    }
+  }
+
+  /// What the detail column would measure with this text — the uptime ticking
+  /// `1m` → `2m` keeps its width and goes through; `1m` → `Stopped` does not.
+  private func detailWidth(_ s: String) -> CGFloat {
+    (s as NSString).size(withAttributes: [.font: detailLabel.font as Any]).width
   }
 
   @objc private func flipped() {
