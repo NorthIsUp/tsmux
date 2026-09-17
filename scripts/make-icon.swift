@@ -1,6 +1,10 @@
-// Renders AppIcon.icns from the same mark the menu bar uses: a dot grid with
-// a chevron rising through it. Generated rather than checked in as binaries,
-// so the icon and the menu bar glyph cannot drift apart.
+// Renders AppIcon.icns from the same mark the menu bar uses. Generated rather
+// than checked in as binaries, so the icon and the menu bar glyph cannot drift
+// apart. Two build products cannot share a source file — this script is run
+// standalone by scripts/build-app.sh, Controller.swift is compiled into the
+// app — so the geometry below is a verbatim copy of the parameter block in
+// `Controller.gridImage` (macos/Sources/TSMuxMenu/Controller.swift). Change one
+// and you must change the other.
 import AppKit
 import Foundation
 
@@ -31,10 +35,9 @@ func drawIcon(size: CGFloat) -> NSImage {
     }
     ctx.restoreGState()
 
-    // The menu bar mark, scaled up. The two are the same drawing so the icon
-    // in the Dock and the glyph in the menu bar cannot look like cousins:
-    // geometry is expressed in the menu bar's own 18x14 point grid and mapped
-    // into this square canvas.
+    // The menu bar mark, scaled up: geometry stays in the menu bar's own 18x14
+    // point grid and is mapped into this square canvas, so every number below
+    // reads the same as it does in Controller.gridImage.
     let k = (13.2 * s / 16.0) / 18.0
     let mid = CGPoint(x: s / 2, y: s / 2)
     func at(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
@@ -74,10 +77,10 @@ func drawIcon(size: CGFloat) -> NSImage {
     }
 
     // Two spare channels straight up and down, greyed: capacity the hub has
-    // that nothing is plugged into.
-    let grey = NSColor(white: 1, alpha: 0.62)
-    ctx.setStrokeColor(grey.cgColor)
-    ctx.setFillColor(grey.cgColor)
+    // that nothing is plugged into. Dimmed by the menu bar's own unlit levels,
+    // which differ for the line and the dot.
+    ctx.setStrokeColor(NSColor(white: 1, alpha: 0.26).cgColor)
+    ctx.setFillColor(NSColor(white: 1, alpha: 0.5).cgColor)
     for ry in [rows[0], rows[2]] {
       let p = at(9, ry)
       ctx.beginPath()
