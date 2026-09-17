@@ -14,9 +14,17 @@ final class Controller: NSObject, NSMenuDelegate {
 
   // MARK: launch
 
+  /// Rows currently on screen, so a status poll can re-render them while the
+  /// menu is open instead of leaving stale state under the user's cursor.
+  private var liveRows: [String: ToggleRowView] = [:]
+  private var hoverTimer: Timer?
+  private var keyboardDriven = false
+  private var lastMouse = NSPoint.zero
+
   func install() {
     model.onChange = { [weak self] in
       self?.updateIcon()
+      self?.refreshLiveRows()
       self?.scheduleTimer()
     }
     menu.delegate = self
@@ -183,13 +191,33 @@ final class Controller: NSObject, NSMenuDelegate {
         if abs(p.1 - hub.y) < 0.01 {
           ctx.addLine(to: hub)
         } else {
-          // Straight runs, not curves: at 18x14 a bend is two grey pixels.
-          ctx.addLine(to: hub)
+          // The app icon's bezier at menu bar scale: a smooth S with strongly
+          // horizontal tangents, so the trace runs flat out of the dot and
+          // arrives flat at the hub with one bend between.
+          let reach = (hub.x - p.0) * 0.62
+          ctx.addCurve(
+            to: hub,
+            control1: CGPoint(x: p.0 + reach, y: p.1),
+            control2: CGPoint(x: hub.x - reach, y: hub.y))
         }
         ctx.strokePath()
         ctx.setFillColor(NSColor.black.withAlphaComponent(dotAlpha).cgColor)
         ctx.fillEllipse(
           in: CGRect(x: p.0 - node, y: p.1 - node, width: node * 2, height: node * 2))
+      }
+
+      // Two spare channels straight up and down, always dim: capacity the hub
+      // has that nothing is plugged into. Same as the app icon, so the two
+      // marks read as one thing.
+      ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.26).cgColor)
+      ctx.setFillColor(NSColor.black.withAlphaComponent(0.5).cgColor)
+      for y in [rows[0], rows[2]] {
+        ctx.beginPath()
+        ctx.move(to: CGPoint(x: hub.x, y: y))
+        ctx.addLine(to: hub)
+        ctx.strokePath()
+        ctx.fillEllipse(
+          in: CGRect(x: hub.x - node, y: y - node, width: node * 2, height: node * 2))
       }
 
       ctx.setFillColor(NSColor.black.withAlphaComponent(dimAll ? 0.3 : 1).cgColor)
@@ -205,8 +233,81 @@ final class Controller: NSObject, NSMenuDelegate {
 
   func menuWillOpen(_ menu: NSMenu) {
     rebuild()
-    model.refresh()  // async; lands for the next open, never mutating a tracking menu
+    model.refresh()
+    keyboardDriven = false
+    lastMouse = NSEvent.mouseLocation
+    let t = Timer(timeInterval: 1 / 30, repeats: true) { _ in
+      MainActor.assumeIsolated { self.trackHover() }
+    }
+    // .common so it keeps ticking while the menu is tracking.
+    RunLoop.main.add(t, forMode: .common)
+    hoverTimer = t
   }
+
+  func menuDidClose(_ menu: NSMenu) {
+    liveRows.removeAll()
+    hoverTimer?.invalidate()
+    hoverTimer = nil
+  }
+
+  /// Keyboard navigation only. AppKit also highlights the first item as the
+  /// menu opens, with the pointer still up in the menu bar and no current
+  /// event at all — invisible on an ordinary item, a painted selection on a
+  /// custom-drawn one. A key press is the only highlight worth taking from
+  /// here; the pointer is `trackHover`'s job.
+  func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+    guard NSApp.currentEvent?.type == .keyDown else { return }
+    keyboardDriven = true
+    for row in liveRows.values {
+      row.setHighlighted(row.enclosingMenuItem === item)
+    }
+  }
+
+  /// Polled, because a menu runs its own event-tracking loop: tracking areas
+  /// inside it never fire, and `willHighlight` cannot be told apart from the
+  /// highlight AppKit hands out at open time. Where the pointer actually is
+  /// answers both. Yields to the keyboard until the pointer moves again, so
+  /// arrowing away from the row the pointer happens to rest on does not leave
+  /// two selections behind.
+  private func trackHover() {
+    let mouse = NSEvent.mouseLocation
+    defer { lastMouse = mouse }
+    if keyboardDriven {
+      guard mouse != lastMouse else { return }
+      keyboardDriven = false
+    }
+    for row in liveRows.values {
+      row.setHighlighted(row.contains(screenPoint: mouse))
+    }
+  }
+
+  /// Re-render the rows under the cursor. The menu no longer closes when a
+  /// switch is flipped, so without this the dot and uptime keep showing the
+  /// state the tailnet was in before the click.
+  private func refreshLiveRows() {
+    guard !liveRows.isEmpty else { return }
+    for p in model.displayProfiles {
+      guard let row = liveRows[p.profile] else { continue }
+      let (symbol, color, label) = Self.appearance(p.condition, state: p.state)
+      row.apply(
+        isOn: p.condition == .running,
+        enabled: p.condition == .running || p.prefs?.connected == false,
+        leading: Self.statusImage(symbol, color),
+        detail: p.condition == .running ? p.uptime : label)
+    }
+    if let row = liveRows[Self.daemonRowKey] {
+      let running = model.daemonRunning
+      let anyUp = model.displayProfiles.contains { $0.condition == .running }
+      let (symbol, color, label) = Self.daemonAppearance(model.ui, anyUp: anyUp)
+      row.apply(
+        isOn: model.displayProfiles.contains { $0.condition == .running },
+        enabled: running ? model.weOwnDaemon : CLI.path != nil,
+        leading: Self.statusImage(symbol, color),
+        detail: running && !model.weOwnDaemon ? "started elsewhere" : label)
+    }
+  }
+
+  static let daemonRowKey = "\u{0}daemon"
 
   private func rebuild() {
     menu.removeAllItems()
@@ -260,16 +361,22 @@ final class Controller: NSObject, NSMenuDelegate {
     menu.addItem(.separator())
 
     // 3. start / stop
+    // The master switch. "tsmux" alone did not say that turning it off takes
+    // every tailnet with it.
     let running = model.daemonRunning
-    menu.addItem(
-      .toggle(
-        title: "tsmux",
-        isOn: running,
-        enabled: running ? model.weOwnDaemon : CLI.path != nil,
-        detail: running && !model.weOwnDaemon ? "started elsewhere" : nil
-      ) { [weak self] on in
-        on ? self?.model.start() : self?.model.stop()
-      })
+    let anyOn = model.displayProfiles.contains { $0.condition == .running }
+    let (dSymbol, dColor, dLabel) = Self.daemonAppearance(model.ui, anyUp: anyOn)
+    let allRow = NSMenuItem.toggle(
+      title: "All tailnets",
+      isOn: anyOn,
+      enabled: running ? model.weOwnDaemon : CLI.path != nil,
+      leading: Self.statusImage(dSymbol, dColor),
+      detail: running && !model.weOwnDaemon ? "started elsewhere" : dLabel
+    ) { [weak self] on in
+      self?.setAllConnected(on)
+    }
+    if let view = allRow.view as? ToggleRowView { liveRows[Self.daemonRowKey] = view }
+    menu.addItem(allRow)
 
     // 4. PAC toggle, 5. copy PAC
     let anyUp = model.profiles.contains { $0.condition == .running }
@@ -421,6 +528,21 @@ final class Controller: NSObject, NSMenuDelegate {
 
   /// Connect or disconnect one tailnet. The daemon keeps running and the
   /// other tailnets are untouched.
+  /// The master switch means what it says: it connects or disconnects every
+  /// tailnet, rather than stopping the daemon out from under them. Turning it
+  /// on with no daemon running starts one first, since there is nothing to
+  /// connect to otherwise.
+  private func setAllConnected(_ on: Bool) {
+    if on, !model.daemonRunning {
+      model.start()
+      return
+    }
+    for p in model.displayProfiles where (p.condition == .running) != on {
+      setConnected(p.profile, on)
+    }
+    model.refresh()
+  }
+
   private func setConnected(_ profile: String, _ on: Bool) {
     if let err = model.setPrefs(profile, ["--connected=\(on)"]) {
       Alert.show(on ? "Could not connect \(profile)" : "Could not disconnect \(profile)", err)
@@ -444,6 +566,7 @@ final class Controller: NSObject, NSMenuDelegate {
     ) { [weak self] on in
       self?.setConnected(p.profile, on)
     }
+    if let view = top.view as? ToggleRowView { liveRows[p.profile] = view }
     top.setAccessibilityLabel("\(p.name), \(label)")
     top.toolTip = p.error.map { "\(p.state): \($0)" } ?? p.state
 
@@ -511,26 +634,51 @@ final class Controller: NSObject, NSMenuDelegate {
     return top
   }
 
+  /// The master switch gets the same visual language as the tailnets it
+  /// controls: connecting, running, or broken, at a glance.
+  /// `anyUp` rather than the daemon's own state: a green tick beside "All
+  /// tailnets" while every tailnet is stopped answers a question nobody asked.
+  static func daemonAppearance(_ ui: UIState, anyUp: Bool) -> (String, NSColor?, String?) {
+    switch ui {
+    case .ok:
+      return anyUp
+        ? ("checkmark.circle.fill", .systemGreen, nil)
+        : ("pause.circle", nil, "all stopped")
+    case .starting: return ("arrow.triangle.2.circlepath", .systemBlue, "starting…")
+    case .down: return ("pause.circle", nil, "off")
+    case .crashed: return ("xmark.octagon.fill", .systemRed, "stopped unexpectedly")
+    case .failed, .cliMissing: return ("xmark.octagon.fill", .systemRed, "error")
+    }
+  }
+
+  /// A nil colour means "no state worth colouring": the glyph renders as a
+  /// template and takes the menu's own text colour.
   static func appearance(_ c: ProfileStatus.Condition, state: String)
-    -> (String, NSColor, String)
+    -> (String, NSColor?, String)
   {
     switch c {
     case .running: return ("checkmark.circle.fill", .systemGreen, "Connected")
     case .starting: return ("arrow.triangle.2.circlepath", .systemBlue, "Connecting…")
     case .needsLogin: return ("exclamationmark.triangle.fill", .systemYellow, "Needs login")
     case .stopped:
-      return ("pause.circle", .tertiaryLabelColor, state == "NoState" ? "Not started" : "Stopped")
+      return ("pause.circle", nil, state == "NoState" ? "Not started" : "Stopped")
     case .failed: return ("xmark.octagon.fill", .systemRed, "Error")
     }
   }
 
-  private static func statusImage(_ symbol: String, _ color: NSColor) -> NSImage? {
-    let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
-      .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
-    // Template images discard palette colours — all five states would flatten.
+  private static func statusImage(_ symbol: String, _ color: NSColor?) -> NSImage? {
+    var config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+    if let color {
+      config = config.applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+    }
     let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
       .withSymbolConfiguration(config)
-    image?.isTemplate = false
+    // A state with a meaning worth colouring keeps its palette colour, which a
+    // template image would flatten. A neutral state has no colour to carry, so
+    // it goes template and picks up the menu's own text colour — the same
+    // black-or-white every ordinary row glyph uses, rather than a hand-picked
+    // grey that only looks right in one appearance.
+    image?.isTemplate = color == nil
     return image
   }
 
