@@ -70,7 +70,10 @@ final class ToggleRowView: NSView {
     toggle.isEnabled = enabled
     toggle.target = self
     toggle.action = #selector(flipped)
-    toggle.controlSize = .regular
+    // .small, not .regular: intrinsicContentSize is identical at every control
+    // size, but the switch is DRAWN larger, and a System-Settings-sized switch
+    // overpowers a menu row.
+    toggle.controlSize = .small
 
     let row = NSStackView(views: [icon, label])
     row.orientation = .horizontal

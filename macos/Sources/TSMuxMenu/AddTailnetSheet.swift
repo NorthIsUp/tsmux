@@ -165,9 +165,11 @@ struct AddTailnetSheet: View {
         )
         .fixedSize(horizontal: false, vertical: true)
       } else {
-        Text("Anything ending in ")
-          + Text(".\(suffix)").font(.system(.body, design: .monospaced))
-          + Text(" now goes to this tailnet.")
+        // Interpolated rather than concatenated: Text's `+` is deprecated as of
+        // macOS 26, and inline styling carries through interpolation.
+        Text(
+          "Anything ending in \(Text(".\(suffix)").font(.system(.body, design: .monospaced))) now goes to this tailnet."
+        )
       }
       Spacer()
       HStack {
