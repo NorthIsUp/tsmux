@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -50,7 +51,7 @@ func root() *cobra.Command {
 	c.PersistentFlags().BoolVarP(&outputJSON, "json", "j", false, "emit JSON")
 	c.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable debug logging")
 	c.AddCommand(cmdInit(), cmdUp(), cmdDown(), cmdStatus(), cmdTest(), cmdProfile(), cmdPAC(),
-		cmdEnv(), cmdRun(), cmdConnect(), cmdTunnel(), cmdDNS(), cmdSSH(), cmdDoctor(), cmdVersion())
+		cmdEnv(), cmdRun(), cmdConnect(), cmdTunnel(), cmdDNS(), cmdSSH(), cmdExpiry(), cmdDoctor(), cmdVersion())
 	return c
 }
 
@@ -262,21 +263,9 @@ func cmdStatus() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Ask the running daemon first; starting our own nodes here would
-			// contend for the same state directories.
-			st, err := cfg.FetchStatus()
+			st, err := fetchStatus(cmd.Context(), cfg, standalone)
 			if err != nil {
-				if !standalone {
-					return err
-				}
-				ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
-				defer cancel()
-				m := tsmux.NewManager(cfg, verbose)
-				if err := m.Start(ctx); err != nil {
-					return err
-				}
-				defer m.Close()
-				st = m.Status(ctx)
+				return err
 			}
 			emit(st, func() {
 				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -296,6 +285,23 @@ func cmdStatus() *cobra.Command {
 	}
 	c.Flags().BoolVar(&standalone, "standalone", false, "start nodes locally if no daemon is running")
 	return c
+}
+
+// fetchStatus asks the running daemon first; starting our own nodes here would
+// contend for the same state directories, so standalone mode is opt-in.
+func fetchStatus(ctx context.Context, cfg *tsmux.Config, standalone bool) ([]tsmux.Status, error) {
+	st, err := cfg.FetchStatus()
+	if err == nil || !standalone {
+		return st, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	m := tsmux.NewManager(cfg, verbose)
+	if err := m.Start(ctx); err != nil {
+		return nil, err
+	}
+	defer m.Close()
+	return m.Status(ctx), nil
 }
 
 func cmdTest() *cobra.Command {
@@ -849,6 +855,78 @@ func cmdSSH() *cobra.Command {
 		},
 	}
 	return c
+}
+
+// --- expiry -----------------------------------------------------------------
+
+func cmdExpiry() *cobra.Command {
+	var warnDays int
+	var standalone, notify bool
+	c := &cobra.Command{
+		Use:   "expiry",
+		Short: "Report how long each tailnet's node key has left",
+		Long: "Report how long each tailnet's node key has left.\n\n" +
+			"Exits 1 if any key has expired or is inside the warning window. A node\n" +
+			"key cannot be renewed unattended: renewing means signing in again in a\n" +
+			"browser, or disabling key expiry for the device in the admin console.",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := load()
+			if err != nil {
+				return err
+			}
+			st, err := fetchStatus(cmd.Context(), cfg, standalone)
+			if err != nil {
+				return err
+			}
+			rs := tsmux.ExpiryReports(st, time.Now(), time.Duration(warnDays)*24*time.Hour)
+			summary := tsmux.ExpirySummary(rs)
+			emit(rs, func() {
+				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "PROFILE\tSTATE\tKEY EXPIRY\tEXPIRES")
+				for _, r := range rs {
+					when := "—"
+					if r.Expires != nil {
+						when = r.Expires.Local().Format("2006-01-02 15:04")
+					}
+					left := string(r.Level)
+					if r.DaysLeft != nil && r.Level != tsmux.ExpiryExpired {
+						left = fmt.Sprintf("%s (%dd)", r.Level, *r.DaysLeft)
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.Profile, r.State, left, when)
+				}
+				w.Flush()
+				if summary != "" {
+					fmt.Println(summary)
+				}
+			})
+			if summary != "" {
+				if notify {
+					notifyUser("Tailscale key expiring", summary)
+				}
+				os.Exit(1)
+			}
+			return nil
+		},
+	}
+	c.Flags().IntVar(&warnDays, "warn-days", int(tsmux.DefaultExpiryWarn/(24*time.Hour)), "warn this many days before a key expires")
+	c.Flags().BoolVar(&standalone, "standalone", false, "start nodes locally if no daemon is running")
+	c.Flags().BoolVar(&notify, "notify", false, "post a macOS notification when a key needs attention")
+	return c
+}
+
+// notifyUser posts a macOS notification. osascript rather than a framework
+// binding: this runs from a LaunchAgent with no bundle to hang a notification
+// off. Passing the text as an argv item keeps quoting out of it.
+func notifyUser(title, body string) {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	script := `on run argv
+	display notification (item 1 of argv) with title "TSMux" subtitle (item 2 of argv)
+end run`
+	if err := exec.Command("osascript", "-e", script, body, title).Run(); err != nil {
+		log.Printf("could not post notification: %v", err)
+	}
 }
 
 // --- doctor / version -------------------------------------------------------

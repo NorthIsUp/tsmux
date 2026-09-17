@@ -309,6 +309,15 @@ final class Controller: NSObject, NSMenuDelegate {
 
   static let daemonRowKey = "\u{0}daemon"
 
+  static func expiryTitle(_ p: ProfileStatus) -> String {
+    switch p.daysUntilExpiry ?? 0 {
+    case ..<0: return "\(p.name)'s key has expired — sign in again…"
+    case 0: return "\(p.name)'s key expires today — sign in again…"
+    case 1: return "\(p.name)'s key expires tomorrow — sign in again…"
+    case let d: return "\(p.name)'s key expires in \(d) days — sign in again…"
+    }
+  }
+
   private func rebuild() {
     menu.removeAllItems()
 
@@ -355,6 +364,15 @@ final class Controller: NSObject, NSMenuDelegate {
     {
       let mi = action("Log in to \(p.name)…", #selector(openLogin(_:)), symbol: "person.badge.key")
       mi.representedObject = url
+      menu.addItem(mi)
+    }
+
+    // A node key expires 180 days after sign-in and cannot be renewed without
+    // one, so the only useful thing to do is say so before it lapses.
+    if let p = model.expiringProfiles.first, let admin = p.adminURL, !admin.isEmpty {
+      let mi = action(
+        Self.expiryTitle(p), #selector(openLogin(_:)), symbol: "clock.badge.exclamationmark")
+      mi.representedObject = admin
       menu.addItem(mi)
     }
 

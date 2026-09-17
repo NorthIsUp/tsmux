@@ -116,6 +116,31 @@ final class AppModel {
 
   var weOwnDaemon: Bool { daemon?.isRunning == true }
 
+  /// Tailnets whose node key is inside the warning window, soonest first. A
+  /// lapsed key stops that tailnet working until someone signs in again, and
+  /// nothing else in the UI says it is coming.
+  var expiringProfiles: [ProfileStatus] {
+    profiles
+      .filter { ($0.daysUntilExpiry ?? Int.max) <= ExpiryWatch.warnDays }
+      .sorted { ($0.daysUntilExpiry ?? 0) < ($1.daysUntilExpiry ?? 0) }
+  }
+
+  /// The weekly check, on or off. The LaunchAgent file is the state — there is
+  /// no second copy in defaults to drift out of step with it.
+  var expiryWatchEnabled: Bool {
+    get { ExpiryWatch.isInstalled }
+    set {
+      do {
+        try newValue ? ExpiryWatch.install() : ExpiryWatch.remove()
+      } catch {
+        Alert.show(
+          newValue ? "Could not schedule the weekly check" : "Could not remove the weekly check",
+          (error as? CLIError)?.message ?? error.localizedDescription)
+      }
+      notify()
+    }
+  }
+
   var daemonRunning: Bool {
     switch ui {
     case .ok, .starting: return true
@@ -181,6 +206,7 @@ final class AppModel {
       if pacAuto, !pacApplied, ps.contains(where: { $0.condition == .running }) {
         applyPAC(auto: true)
       }
+      if !expiringProfiles.isEmpty { noticeExpiry() }
     } else if let deadline = startDeadline, Date() > deadline {
       startDeadline = nil
       if crashLine == nil {
@@ -191,6 +217,18 @@ final class AppModel {
   }
 
   private func notify() { onChange?() }
+
+  static let expiryNoticeKey = "lastExpiryNotice"
+
+  /// At most one notification a day while the app is open. The menu row is the
+  /// persistent reminder; a banner on every 5-second refresh would be noise.
+  private func noticeExpiry() {
+    let today = Calendar.current.startOfDay(for: Date())
+    let last = UserDefaults.standard.object(forKey: Self.expiryNoticeKey) as? Date
+    guard last == nil || last! < today else { return }
+    UserDefaults.standard.set(Date(), forKey: Self.expiryNoticeKey)
+    ExpiryWatch.checkNow()
+  }
 
   // MARK: daemon lifecycle
 

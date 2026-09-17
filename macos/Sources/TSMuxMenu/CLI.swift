@@ -202,6 +202,15 @@ struct ProfileStatus: Decodable, Sendable, Identifiable {
     return ISO8601DateFormatter().date(from: s)
   }
 
+  /// Days until the node key expires. nil when the key does not expire at all
+  /// — a tagged device, or one with key expiry disabled — and nil while the
+  /// node is not running, because a stopped node has reported nothing yet and
+  /// "no date" must not read as "never".
+  var daysUntilExpiry: Int? {
+    guard condition == .running, let d = expiryDate else { return nil }
+    return Calendar.current.dateComponents([.day], from: Date(), to: d).day
+  }
+
   /// Suffixes beyond the one learned from the tailnet itself.
   var extraSuffixes: [String] {
     let learned = magicDNSSuffix.map { "." + $0.lowercased() } ?? ""

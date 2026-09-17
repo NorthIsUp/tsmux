@@ -11,6 +11,7 @@ struct GlobalSettingsTab: View {
   @State private var showCLI = false
   @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
   @State private var pacURL: String = ""
+  @State private var expiryWatchOn = ExpiryWatch.isInstalled
 
   var body: some View {
     Form {
@@ -27,6 +28,15 @@ struct GlobalSettingsTab: View {
         UnavailableRow(
           title: "Tailnet Lock", note: Unavailable.tailnetLock,
           control: AnyView(Button("Manage…") {}))
+      }
+      Section("Node keys") {
+        Toggle("Check key expiry weekly", isOn: expiryWatchBinding)
+        Text(
+          "A Tailscale node key expires 180 days after you sign in and cannot be renewed "
+            + "without signing in again. This installs a weekly LaunchAgent that notifies you "
+            + "\(ExpiryWatch.warnDays) days before one lapses. Turning it off removes the agent."
+        )
+        .font(.footnote).foregroundStyle(.secondary)
       }
       Section("CLI integration") {
         LabeledContent("Command line") {
@@ -83,6 +93,15 @@ struct GlobalSettingsTab: View {
         CopyableValue(value: pacURL.isEmpty ? "unavailable while tsmux is stopped" : pacURL)
       }
     }
+  }
+
+  private var expiryWatchBinding: Binding<Bool> {
+    Binding(
+      get: { expiryWatchOn },
+      set: { on in
+        model.expiryWatchEnabled = on
+        expiryWatchOn = ExpiryWatch.isInstalled
+      })
   }
 
   private var pacBinding: Binding<Bool> {

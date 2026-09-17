@@ -90,6 +90,7 @@ go install github.com/NorthIsUp/tsmux@latest
 | `ssh` / `connect` / `tunnel` | SSH, raw TCP, forwarded local ports |
 | `profile add/list/rm/set` | manage tailnets without the GUI |
 | `pac print/url/apply/restore` | the browser proxy config |
+| `expiry` | days left on each tailnet's node key; exits 1 when one is close |
 | `doctor` | config, port and overlap checks |
 
 Every command takes `--json`.
@@ -149,6 +150,39 @@ Routing order: longest matching suffix, then `ip_routes` for literal addresses,
 then `match_root` for bare names. Anything unmatched is refused rather than
 sent to an arbitrary tailnet. `tsmux doctor` reports overlaps and port
 conflicts. tsmux owns this file and rewrites it; comments are not preserved.
+
+## Node keys expire
+
+A Tailscale node key lasts 180 days from the browser sign-in that created it.
+When one lapses that tailnet stops working until you sign in again, and nothing
+about it is automatic: the client can only *shorten* its own expiry, never
+extend it, so there is no unattended renewal to build. What tsmux can do is
+make sure the date never surprises you.
+
+```sh
+tsmux expiry              # a line per tailnet; exits 1 if any is close or lapsed
+tsmux expiry --json --warn-days 30
+```
+
+**Settings → General → Node keys → Check key expiry weekly** installs a
+LaunchAgent (`~/Library/LaunchAgents/dev.northisup.tsmux.expiry.plist`) that
+runs `tsmux expiry --notify` every Sunday morning and posts a notification only
+when a key is within 21 days. Turning the toggle off unloads and deletes it;
+nothing is installed unless you ask. The menu also carries a row for the
+soonest-expiring tailnet, which opens the admin console to sign in again.
+
+### Making it moot
+
+Either of these stops the countdown for good, and both are set in the admin
+console rather than from the node:
+
+- **Disable key expiry** for the device — Machines → the device → ⋯ → *Disable
+  key expiry*. tsmux then reports `never` for it.
+- **Register the node under a tag** (an auth key or OAuth client with tags).
+  A tagged node has no key expiry at all; Tailscale's client treats a zero
+  expiry as exactly that, and tagged nodes are the case it means. Set
+  `auth_key_env` on the profile to register with such a key. Note that a tagged
+  node is owned by the tailnet, not by you, so ACLs must grant it what it needs.
 
 ## Limitations
 
